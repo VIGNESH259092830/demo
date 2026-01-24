@@ -1,0 +1,264 @@
+const { LOGO_BASE64 } = require('./logo.js');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, screen } = require('electron');
+const path = require('path');
+const { spawn } = require('child_process');
+
+let mainWindow = null;
+let circleWindow = null;
+let tray = null;
+let pythonServer = null;
+let isMinimized = false;
+
+/* ======================================================
+   MAIN INVISIBLE WINDOW (LOCKED)
+   ====================================================== */
+function createWindow() {
+    mainWindow = new BrowserWindow({
+        width: 800,
+        height: 600,
+        minWidth: 780,
+        minHeight: 550,
+        frame: false,
+        transparent: true,
+        backgroundColor: '#00000000',
+        show: true,
+
+        // 🔴 NEVER appear in taskbar / Alt+Tab
+        skipTaskbar: false, // Changed to false to show in taskbar when not minimized
+
+        // 🔥 MUST stay above all apps
+        alwaysOnTop: true,
+
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js')
+        }
+    });
+
+    // 🔐 Invisible to screen sharing (Zoom / Teams / OBS)
+    mainWindow.setContentProtection(false); // Changed to false to allow normal operation
+
+    // 🔥 Strongest Windows always-on-top level
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
+
+    mainWindow.loadFile('index.html');
+
+    createTray();
+    startBackend();
+
+    /* ================= IPC ================= */
+
+    ipcMain.on('minimize-window', minimizeToCircle);
+    ipcMain.on('close-window', () => app.quit());
+    ipcMain.on('restore-window', restoreFromCircle);
+
+    ipcMain.on('move-circle', (event, x, y) => {
+        if (circleWindow) {
+            circleWindow.setPosition(x, y);
+        }
+    });
+
+    /* ======================================================
+       🔒 INVISIBILITY + FOREGROUND PROTECTION
+       ====================================================== */
+
+    // ❌ Block OS minimize (Alt+Tab / Win shortcuts)
+    mainWindow.on('minimize', (e) => {
+        e.preventDefault();
+        if (!isMinimized) {
+            mainWindow.show();
+            mainWindow.setAlwaysOnTop(true, 'screen-saver');
+        }
+    });
+
+    // 🔥 If focus lost (click outside / switch app)
+    mainWindow.on('blur', () => {
+        if (!isMinimized) {
+            // Stay invisible but force front
+            mainWindow.show();
+            mainWindow.setAlwaysOnTop(true, 'screen-saver');
+        }
+    });
+
+    // ❌ Never allow OS hide
+    mainWindow.on('hide', () => {
+        if (!isMinimized) {
+            mainWindow.show();
+        }
+    });
+}
+
+/* ======================================================
+   CIRCLE WINDOW (INVISIBLE TO SCREEN CAPTURE)
+   ====================================================== */
+function createCircleWindow(x, y) {
+    if (circleWindow) {
+        circleWindow.focus();
+        circleWindow.setAlwaysOnTop(true, 'screen-saver');
+        return circleWindow;
+    }
+
+    circleWindow = new BrowserWindow({
+        width: 60,
+        height: 60,
+        x,
+        y,
+        frame: false,
+        transparent: true,
+        backgroundColor: '#00000000',
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        resizable: false,
+        movable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        show: false,
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js')
+        }
+    });
+
+    // 🔐 Invisible to screen capture
+    circleWindow.setContentProtection(false); // Changed to false
+    circleWindow.setAlwaysOnTop(true, 'screen-saver');
+
+    circleWindow.loadFile('circle.html');
+
+    circleWindow.on('closed', () => {
+        circleWindow = null;
+    });
+
+    return circleWindow;
+}
+
+/* ======================================================
+   MINIMIZE TO CIRCLE (POSITION AT TOP CENTER)
+   ====================================================== */
+function minimizeToCircle() {
+    if (!mainWindow) return;
+
+    isMinimized = true;
+    mainWindow.hide();
+    mainWindow.setSkipTaskbar(true); // Hide from taskbar when minimized to circle
+
+    // 🎯 POSITION AT TOP CENTER OF SCREEN
+    const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+    const circleX = Math.floor((width - 60) / 2); // Center horizontally
+    const circleY = 20; // 20px from top
+
+    const circleWin = createCircleWindow(circleX, circleY);
+    circleWin.show();
+    circleWin.focus();
+    circleWin.setAlwaysOnTop(true, 'screen-saver');
+}
+
+/* ======================================================
+   RESTORE FROM CIRCLE
+   ====================================================== */
+function restoreFromCircle() {
+    if (!mainWindow) return;
+
+    isMinimized = false;
+    mainWindow.setSkipTaskbar(false); // Show in taskbar again
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
+
+    if (circleWindow) {
+        circleWindow.hide();
+    }
+}
+
+/* ======================================================
+   TRAY
+   ====================================================== */
+function createTray() {
+    const icon = nativeImage.createFromDataURL(LOGO_BASE64);
+    tray = new Tray(icon);
+
+    const contextMenu = Menu.buildFromTemplate([
+        {
+            label: 'Show Interview Helper',
+            click: () => isMinimized ? restoreFromCircle() : mainWindow.show()
+        },
+        {
+            label: 'Minimize to Circle',
+            click: minimizeToCircle
+        },
+        { type: 'separator' },
+        {
+            label: 'Quit',
+            click: () => app.quit()
+        }
+    ]);
+
+    tray.setToolTip('Interview Helper');
+    tray.setContextMenu(contextMenu);
+
+    tray.on('click', () => {
+        if (isMinimized) restoreFromCircle();
+        else mainWindow.show();
+    });
+}
+
+/* ======================================================
+   BACKEND START - UPDATED WITH YOUR CODE
+   ====================================================== */
+function startBackend() {
+    const isProd = app.isPackaged;
+
+    let command;
+    let args = [];
+
+    if (isProd) {
+        // ✅ PRODUCTION: run packaged backend.exe
+        command = path.join(process.resourcesPath, 'backend', 'backend.exe');
+    } else {
+        // ✅ DEVELOPMENT: run python main.py
+        command = process.platform === 'win32' ? 'python' : 'python3';
+        args = [path.join(__dirname, '..', 'app', 'main.py')];
+    }
+
+    pythonServer = spawn(command, args, {
+        detached: true,
+        stdio: isProd ? 'ignore' : 'pipe'
+    });
+
+    pythonServer.unref();
+
+    if (!isProd) {
+        pythonServer.stdout.on('data', d =>
+            console.log(`Backend: ${d.toString()}`)
+        );
+        pythonServer.stderr.on('data', d =>
+            console.error(`Backend Error: ${d.toString()}`)
+        );
+    }
+}
+
+/* ======================================================
+   APP LIFECYCLE
+   ====================================================== */
+app.whenReady().then(createWindow);
+
+app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+        if (pythonServer) pythonServer.kill();
+        app.quit();
+    }
+});
+
+app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+    }
+});
+
+app.on('before-quit', () => {
+    if (pythonServer) pythonServer.kill();
+    if (circleWindow) circleWindow.close();
+});

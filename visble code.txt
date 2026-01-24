@@ -1,0 +1,185 @@
+const { LOGO_BASE64 } = require('./logo.js');
+
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, screen } = require('electron');
+const path = require('path');
+const { spawn } = require('child_process');
+
+let mainWindow = null;
+let circleWindow = null;
+let tray = null;
+let pythonServer = null;
+let isMinimized = false;
+
+function createWindow() {
+    mainWindow = new BrowserWindow({
+        width: 800,
+        height: 600,
+        minWidth: 780,
+        minHeight: 550,
+        frame: false,
+        transparent: true,
+        backgroundColor: '#00000000',
+        show: true,
+
+        // ✅ VISIBLE in taskbar & Alt-Tab
+        skipTaskbar: false,
+
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js')
+        }
+    });
+
+    // 🔓 ALLOW screen sharing / recording
+    mainWindow.setContentProtection(false);
+
+    mainWindow.loadFile('index.html');
+
+    createTray();
+    startBackend();
+
+    ipcMain.on('minimize-window', minimizeToCircle);
+    ipcMain.on('close-window', () => app.quit());
+    ipcMain.on('restore-window', restoreFromCircle);
+
+    ipcMain.on('move-circle', (event, x, y) => {
+        if (circleWindow) {
+            circleWindow.setPosition(x, y);
+        }
+    });
+}
+
+function createCircleWindow(x, y) {
+    if (circleWindow) {
+        circleWindow.focus();
+        return circleWindow;
+    }
+
+    circleWindow = new BrowserWindow({
+        width: 60,
+        height: 60,
+        x,
+        y,
+        frame: false,
+        transparent: true,
+        backgroundColor: '#00000000',
+        alwaysOnTop: true,
+
+        // ❌ Circle hidden from taskbar (normal behavior)
+        skipTaskbar: true,
+
+        resizable: false,
+        movable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        show: false,
+
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js')
+        }
+    });
+
+    // 🔓 Allow capture
+    circleWindow.setContentProtection(false);
+
+    circleWindow.loadFile('circle.html');
+    circleWindow.setIgnoreMouseEvents(false);
+
+    circleWindow.on('closed', () => {
+        circleWindow = null;
+    });
+
+    return circleWindow;
+}
+
+function minimizeToCircle() {
+    if (!mainWindow) return;
+
+    mainWindow.hide();
+    mainWindow.setSkipTaskbar(true);
+    isMinimized = true;
+
+    const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+    const circleX = width - 100;
+    const circleY = height - 100;
+
+    const circleWin = createCircleWindow(circleX, circleY);
+    circleWin.show();
+    circleWin.focus();
+}
+
+function restoreFromCircle() {
+    if (!mainWindow) return;
+
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.setSkipTaskbar(false);
+    isMinimized = false;
+
+    if (circleWindow) {
+        circleWindow.hide();
+    }
+}
+
+function createTray() {
+    const icon = nativeImage.createFromDataURL(LOGO_BASE64);
+    tray = new Tray(icon);
+
+    const contextMenu = Menu.buildFromTemplate([
+        {
+            label: 'Show Interview Helper',
+            click: () => isMinimized ? restoreFromCircle() : mainWindow.show()
+        },
+        {
+            label: 'Minimize to Circle',
+            click: minimizeToCircle
+        },
+        { type: 'separator' },
+        {
+            label: 'Quit',
+            click: () => app.quit()
+        }
+    ]);
+
+    tray.setToolTip('Interview Helper');
+    tray.setContextMenu(contextMenu);
+
+    tray.on('click', () => {
+        if (isMinimized) restoreFromCircle();
+        else mainWindow.show();
+    });
+}
+
+function startBackend() {
+    const pythonPath = process.platform === 'win32' ? 'python' : 'python3';
+    const scriptPath = path.join(__dirname, 'main.py');
+
+    pythonServer = spawn(pythonPath, [scriptPath]);
+
+    pythonServer.stdout.on('data', d => console.log(`Backend: ${d}`));
+    pythonServer.stderr.on('data', d => console.error(`Backend Error: ${d}`));
+}
+
+app.whenReady().then(createWindow);
+
+app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+        if (pythonServer) pythonServer.kill();
+        app.quit();
+    }
+});
+
+app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+    }
+});
+
+app.on('before-quit', () => {
+    if (pythonServer) pythonServer.kill();
+    if (circleWindow) circleWindow.close();
+});

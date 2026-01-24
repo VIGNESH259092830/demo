@@ -1,0 +1,5844 @@
+from openai import AzureOpenAI
+import threading
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Initialize Azure OpenAI client
+client = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version="2024-02-15-preview"
+)
+
+DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+
+def ask_ai(text, callback):
+    """Asynchronous AI call"""
+    if not text:
+        callback("")
+        return
+
+    def run():
+        try:
+            resp = client.chat.completions.create(
+                model=DEPLOYMENT,
+                messages=[{"role": "user", "content": text}],
+                temperature=0.3,
+                max_tokens=1000,
+            )
+            callback(resp.choices[0].message.content)
+        except Exception as e:
+            callback(f"Error: {str(e)}")
+
+    threading.Thread(target=run, daemon=True).start()
+
+def ask_ai_sync(text):
+    """Synchronous AI call for streaming"""
+    if not text:
+        return ""
+    
+    try:
+        resp = client.chat.completions.create(
+            model=DEPLOYMENT,
+            messages=[{"role": "user", "content": text}],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"Error: {str(e)}"def build_interview_prompt(session_data: dict, current_question: str, history: list = None) -> str:
+    """Build interview-aware prompt using session data and history"""
+    
+    # Extract session data
+    company = session_data.get('company', 'Unknown Company')
+    job_desc = session_data.get('job_description', 'No job description')
+    resume = session_data.get('resume_text', 'No resume provided')
+    extra_context = session_data.get('extra_context', 'No extra context')
+    
+    # Build base prompt
+    prompt = f"""You are an AI interview assistant helping a candidate prepare for a job interview.
+
+IMPORTANT CONTEXT:
+- Company: {company}
+- Job Description: {job_desc}
+- Candidate Resume: {resume}
+- Additional Instructions: {extra_context}
+
+INTERVIEW RULES:
+1. Provide professional, interview-style answers
+2. Tailor responses to match the company culture and job requirements
+3. Reference the candidate's resume when relevant
+4. Use bullet points for clarity
+5. Include code examples when discussing technical topics
+6. Keep answers concise but comprehensive
+
+IMPORTANT FORMATTING RULES FOR CODE:
+1. When providing code, wrap it in triple backticks with language specification
+2. Format: ```python\n# your code here\n```
+3. Supported languages: python, javascript, java, cpp, c, html, css, sql, bash
+4. Include comments in code for clarity
+5. For HTML/CSS questions, provide complete, working examples
+
+CONVERSATION HISTORY:
+"""
+    
+    # Add conversation history
+    if history:
+        for item in history:
+            role = "Interviewer" if item["role"] == "question" else "Candidate"
+            prompt += f"\n{role}: {item['content']}"
+    else:
+        prompt += "\nNo previous conversation history."
+    
+    # Add current question
+    prompt += f"""
+
+CURRENT INTERVIEW QUESTION:
+"{current_question}"
+
+Please provide a well-structured interview answer that:
+1. Directly addresses the question
+2. Includes relevant code examples if technical
+3. Incorporates experience from the resume
+4. Aligns with the job requirements
+5. Shows practical implementation
+
+ANSWER:
+"""
+    
+    return promptimport azure.cognitiveservices.speech as speechsdk
+from app.shared.state import state
+import time
+import threading
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Global variables
+_mic_recognizer = None
+_mic_active = False
+_on_mic_text_callback = None
+_last_final_text = ""
+_partial_buffer = ""
+_last_partial_time = 0
+
+# 🔥 ADD THESE GLOBAL VARIABLES FOR TRACKING
+_pending_partials = {}  # Move to global scope
+_sentence_history = []  # Track recent sentences
+_last_processed_time = 0
+
+def _create_mic_recognizer():
+    """Create microphone recognizer"""
+    try:
+        audio_cfg = speechsdk.audio.AudioConfig(use_default_microphone=True)
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=state.speech_config,
+            audio_config=audio_cfg
+        )
+        
+        # Set timeouts
+        recognizer.properties.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
+            "300000"  # 5 minutes
+        )
+        recognizer.properties.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
+            "30000"   # 30 seconds
+        )
+        
+        return recognizer
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to create mic recognizer: {e}")
+        return None
+
+def _setup_mic_handlers(recognizer):
+    """Setup microphone handlers - FIXED FOR NO DUPLICATION"""
+    
+    def recognizing_handler(evt):
+        if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech:
+            text = evt.result.text.strip()
+            if not text:
+                return
+                
+            global _partial_buffer, _last_partial_time, _pending_partials
+            current_time = time.time()
+            
+            # 🔥 SIMPLER DUPLICATE CHECK
+            # Skip if same partial within 150ms
+            if text == _partial_buffer and (current_time - _last_partial_time) < 0.15:
+                return
+            
+            # Skip if partial matches last final text
+            if text == _last_final_text:
+                return
+            
+            # Update tracking
+            _partial_buffer = text
+            _last_partial_time = current_time
+            
+            # Store partial (with timestamp)
+            _pending_partials[text] = current_time
+            
+            # Clean old partials (older than 1.5 seconds)
+            for key, timestamp in list(_pending_partials.items()):
+                if current_time - timestamp > 1.5:
+                    del _pending_partials[key]
+            
+            # Send partial callback
+            if _on_mic_text_callback:
+                _on_mic_text_callback(text, is_final=False)
+                logger.debug(f"🎤 Mic partial: {text}")
+    
+    def recognized_handler(evt):
+        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            text = evt.result.text.strip()
+            if not text:
+                return
+                
+            global _last_final_text, _partial_buffer, _pending_partials, _sentence_history, _last_processed_time
+            current_time = time.time()
+            
+            # 🔥 CRITICAL FIX: Clear partial buffer
+            _partial_buffer = ""
+            
+            # 🔥 CHECK 1: Skip if same as last final (exact match)
+            if text == _last_final_text:
+                logger.debug(f"🎤 Skipping exact duplicate: {text}")
+                return
+            
+            # 🔥 CHECK 2: Skip if we just processed this within 300ms
+            if (current_time - _last_processed_time) < 0.3:
+                logger.debug(f"🎤 Skipping too recent: {text}")
+                return
+            
+            # 🔥 CHECK 3: Skip if this text is in recent history
+            # Check if this sentence is contained in or contains recent sentences
+            text_lower = text.lower()
+            skip_duplicate = False
+            
+            for past_sentence, past_time in _sentence_history:
+                past_lower = past_sentence.lower()
+                
+                # If current text contains past text OR past text contains current text
+                # AND they're within 2 seconds of each other
+                if (text_lower.find(past_lower) >= 0 or past_lower.find(text_lower) >= 0) and \
+                   (current_time - past_time) < 2.0:
+                    skip_duplicate = True
+                    logger.debug(f"🎤 Skipping overlapping text: '{text}' overlaps with '{past_sentence}'")
+                    break
+            
+            if skip_duplicate:
+                return
+            
+            # 🔥 CHECK 4: Check pending partials
+            # If this final text matches a recent partial, skip it
+            text_words = text.split()
+            if len(text_words) > 0:
+                for partial_text, partial_time in list(_pending_partials.items()):
+                    partial_words = partial_text.split()
+                    
+                    # If final text starts with partial text and it's recent
+                    if len(text_words) >= len(partial_words):
+                        if ' '.join(text_words[:len(partial_words)]) == partial_text and \
+                           (current_time - partial_time) < 1.0:
+                            logger.debug(f"🎤 Skipping final matching recent partial: {text}")
+                            # Remove this partial
+                            if partial_text in _pending_partials:
+                                del _pending_partials[partial_text]
+                            return
+            
+            # 🔥 ALL CHECKS PASSED - PROCESS THIS TEXT
+            
+            # Update tracking
+            _last_final_text = text
+            _last_processed_time = current_time
+            
+            # Add to sentence history (keep last 5)
+            _sentence_history.append((text, current_time))
+            if len(_sentence_history) > 5:
+                _sentence_history.pop(0)
+            
+            # Clear all pending partials (fresh start for next sentence)
+            _pending_partials.clear()
+            
+            # Send final callback
+            if _on_mic_text_callback:
+                _on_mic_text_callback(text, is_final=True)
+                logger.info(f"🎤 Mic final: {text}")
+    
+    def session_stopped_handler(evt):
+        global _mic_active
+        logger.warning("🎤 Mic session stopped")
+        _mic_active = False
+        
+        # Auto-restart
+        threading.Thread(target=_recover_mic, daemon=True).start()
+    
+    def canceled_handler(evt):
+        logger.warning(f"🎤 Mic recognition canceled: {evt.reason}")
+        threading.Thread(target=_recover_mic, daemon=True).start()
+    
+    def session_started_handler(evt):
+        logger.info("✅ Mic session started")
+    
+    recognizer.recognizing.connect(recognizing_handler)
+    recognizer.recognized.connect(recognized_handler)
+    recognizer.session_stopped.connect(session_stopped_handler)
+    recognizer.canceled.connect(canceled_handler)
+    recognizer.session_started.connect(session_started_handler)
+
+def _recover_mic():
+    """Recover microphone"""
+    global _mic_recognizer, _mic_active, _last_final_text, _partial_buffer, _pending_partials, _sentence_history
+    
+    logger.info("🔄 Recovering microphone...")
+    time.sleep(2.0)
+    
+    try:
+        if _mic_recognizer:
+            try:
+                _mic_recognizer.stop_continuous_recognition()
+            except:
+                pass
+        
+        # 🔥 RESET ALL TRACKING VARIABLES
+        _last_final_text = ""
+        _partial_buffer = ""
+        _pending_partials.clear()
+        _sentence_history.clear()
+        
+        recognizer = _create_mic_recognizer()
+        if not recognizer:
+            raise Exception("Failed to create recognizer")
+        
+        _setup_mic_handlers(recognizer)
+        recognizer.start_continuous_recognition()
+        
+        _mic_recognizer = recognizer
+        _mic_active = True
+        
+        logger.info("✅ Microphone recovered")
+        
+    except Exception as e:
+        logger.error(f"❌ Mic recovery failed: {e}")
+        threading.Timer(5.0, _recover_mic).start()
+
+def start_mic_stt(callback=None):
+    """Start microphone STT with callback - FIXED"""
+    global _mic_recognizer, _mic_active, _on_mic_text_callback
+    global _last_final_text, _partial_buffer, _pending_partials, _sentence_history
+    
+    # Store callback
+    _on_mic_text_callback = callback
+    
+    # 🔥 RESET ALL TRACKING VARIABLES
+    _last_final_text = ""
+    _partial_buffer = ""
+    _pending_partials.clear()
+    _sentence_history.clear()
+    
+    logger.info("🎤 Starting microphone STT...")
+    
+    try:
+        recognizer = _create_mic_recognizer()
+        if not recognizer:
+            raise Exception("Failed to create mic recognizer")
+        
+        _setup_mic_handlers(recognizer)
+        recognizer.start_continuous_recognition()
+        
+        _mic_recognizer = recognizer
+        _mic_active = True
+        
+        logger.info("✅ Mic STT started successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to start mic STT: {e}")
+        threading.Timer(5.0, lambda: start_mic_stt(callback)).start()
+
+def stop_mic_stt():
+    """Stop microphone STT"""
+    global _mic_recognizer, _mic_active, _last_final_text, _partial_buffer, _pending_partials, _sentence_history
+    
+    # 🔥 RESET ALL TRACKING VARIABLES
+    _last_final_text = ""
+    _partial_buffer = ""
+    _pending_partials.clear()
+    _sentence_history.clear()
+    
+    if _mic_recognizer:
+        try:
+            _mic_recognizer.stop_continuous_recognition()
+            _mic_active = False
+            logger.info("✅ Mic STT stopped")
+        except Exception as e:
+            logger.error(f"❌ Error stopping mic: {e}")
+
+def get_mic_status():
+    """Get microphone status"""
+    return {
+        "active": _mic_active,
+        "recognizer_exists": _mic_recognizer is not None,
+        "last_final_text": _last_final_text,
+        "partial_buffer": _partial_buffer,
+        "pending_partials_count": len(_pending_partials),
+        "sentence_history_count": len(_sentence_history)
+    }# app/audio/system_stt.py - COMPLETE WORKING VERSION WITH DUPLICATE PREVENTION
+import soundcard as sc
+import numpy as np
+import azure.cognitiveservices.speech as speechsdk
+import threading
+import time
+import logging
+import traceback
+from app.shared import state
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ================= CONFIGURATION =================
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 1024
+SILENCE_THRESHOLD = 0.0001
+DEVICE_CHECK_INTERVAL = 5.0
+KEEP_ALIVE_INTERVAL = 5.0
+MIN_AUDIO_LEVEL = 0.00001
+
+# ================= GLOBAL STATE =================
+_system_recognizer = None
+_system_stream = None
+_system_active = False
+_system_audio_thread = None
+_stop_system_audio = False
+_system_lock = threading.RLock()
+_current_speaker = None
+_last_audio_time = time.time()
+_device_recovery_count = 0
+_health_monitor_thread = None
+_is_streaming = False
+_recognizer_ready = False
+_stream_closed = False
+_forced_restart = False
+
+# 🔥 NEW: Duplicate prevention for system audio
+_system_last_final_text = ""
+_system_partial_buffer = ""
+_system_last_partial_time = 0
+_system_final_history = []
+_system_partial_history = []
+_system_processing_lock = threading.RLock()
+
+# ================= SPEECH RECOGNIZER =================
+def _create_speech_recognizer():
+    """Create a persistent speech recognizer with proper timeouts"""
+    global _recognizer_ready, _stream_closed
+    
+    try:
+        _stream_closed = False
+        
+        stream_format = speechsdk.audio.AudioStreamFormat(
+            samples_per_second=SAMPLE_RATE,
+            bits_per_sample=16,
+            channels=2
+        )
+        push_stream = speechsdk.audio.PushAudioInputStream(stream_format)
+        
+        audio_config = speechsdk.audio.AudioConfig(stream=push_stream)
+        
+        if not state.speech_config:
+            raise ValueError("No speech configuration available")
+        
+        recognizer = speechsdk.SpeechRecognizer(
+            speech_config=state.speech_config,
+            audio_config=audio_config
+        )
+        
+        recognizer.properties.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs,
+            "15000"
+        )
+        
+        recognizer.properties.set_property(
+            speechsdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
+            "1000"
+        )
+        
+        logger.info("✅ Speech recognizer created with 15s/1s timeouts")
+        _recognizer_ready = True
+        
+        return recognizer, push_stream
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to create recognizer: {e}")
+        _recognizer_ready = False
+        raise e
+
+# ================= DEVICE MANAGEMENT =================
+def _find_best_speaker():
+    """Find the best available speaker device"""
+    try:
+        speaker = sc.default_speaker()
+        if speaker:
+            return speaker
+        
+        speakers = sc.all_speakers()
+        if speakers:
+            return speakers[0]
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"❌ Error finding speaker: {e}")
+        return None
+
+def _setup_loopback_microphone(speaker):
+    """Setup loopback microphone for a speaker"""
+    try:
+        if not speaker:
+            return None
+        
+        # Try different methods
+        methods = [
+            lambda: sc.get_microphone(id=str(speaker.id), include_loopback=True),
+            lambda: sc.get_microphone(id=speaker.name, include_loopback=True),
+            lambda: sc.default_microphone(include_loopback=True),
+            lambda: next((m for m in sc.all_microphones(include_loopback=True) 
+                         if "loopback" in m.name.lower()), None)
+        ]
+        
+        for method in methods:
+            try:
+                mic = method()
+                if mic:
+                    logger.info(f"✅ Found loopback: {mic.name}")
+                    return mic
+            except:
+                continue
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"❌ Loopback setup failed: {e}")
+        return None
+
+# ================= DUPLICATE PREVENTION =================
+def _is_system_duplicate(text, is_final, current_time):
+    """Check if system audio text is a duplicate"""
+    global _system_last_final_text, _system_partial_buffer, _system_last_partial_time
+    global _system_final_history, _system_partial_history
+    
+    with _system_processing_lock:
+        if is_final:
+            # Skip if same as last final text within 50ms
+            if text == _system_last_final_text and (current_time - _system_last_partial_time) < 0.05:
+                return True
+            
+            # Skip if in recent history
+            if text in _system_final_history:
+                return True
+            
+            # Check for punctuation variations
+            import re
+            clean_text = re.sub(r'[.,;!?]+$', '', text)
+            for history_text in _system_final_history:
+                clean_history = re.sub(r'[.,;!?]+$', '', history_text)
+                if clean_text == clean_history:
+                    return True
+            
+            # Add to history (keep last 5)
+            _system_final_history.append(text)
+            if len(_system_final_history) > 5:
+                _system_final_history.pop(0)
+            
+            _system_last_final_text = text
+            
+        else:
+            # For partial text
+            # Skip if same partial within 30ms
+            if text == _system_partial_buffer and (current_time - _system_last_partial_time) < 0.03:
+                return True
+            
+            # Skip if partial is contained in last final text
+            if _system_last_final_text and text in _system_last_final_text:
+                return True
+            
+            # Skip if in recent partial history
+            if text in _system_partial_history:
+                return True
+            
+            # Update tracking
+            _system_partial_buffer = text
+            _system_last_partial_time = current_time
+            
+            # Add to history (keep last 3)
+            _system_partial_history.append(text)
+            if len(_system_partial_history) > 3:
+                _system_partial_history.pop(0)
+        
+        return False
+
+def _clean_system_text(text):
+    """Clean system audio text"""
+    import re
+    
+    # Remove extra spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Remove trailing punctuation
+    text = re.sub(r'[.,;!?]+$', '', text)
+    
+    # Remove consecutive duplicate words
+    words = text.split()
+    if len(words) > 1:
+        cleaned_words = []
+        for i, word in enumerate(words):
+            if i == 0 or word.lower() != words[i-1].lower():
+                cleaned_words.append(word)
+        text = ' '.join(cleaned_words)
+    
+    return text
+
+# ================= AUDIO CAPTURE ENGINE =================
+def _audio_capture_engine():
+    """Main audio capture engine"""
+    global _current_speaker, _last_audio_time, _device_recovery_count, _is_streaming
+    global _stream_closed, _forced_restart
+    
+    logger.info("🚀 Starting audio capture engine...")
+    
+    while not _stop_system_audio:
+        try:
+            speaker = _find_best_speaker()
+            if not speaker:
+                time.sleep(2.0)
+                continue
+            
+            _current_speaker = speaker
+            
+            mic = _setup_loopback_microphone(speaker)
+            if not mic:
+                time.sleep(3.0)
+                continue
+            
+            logger.info(f"🎧 Capturing from: {speaker.name}")
+            
+            with mic.recorder(samplerate=SAMPLE_RATE, channels=2) as recorder:
+                _is_streaming = True
+                _stream_closed = False
+                logger.info("✅ Audio stream started")
+                
+                while not _stop_system_audio and _is_streaming:
+                    try:
+                        # Capture audio
+                        try:
+                            audio_data = recorder.record(numframes=CHUNK_SIZE)
+                        except Exception as e:
+                            logger.error(f"🎤 Capture error: {e}")
+                            time.sleep(0.1)
+                            continue
+                        
+                        if audio_data is None or len(audio_data) == 0:
+                            audio_data = np.zeros((CHUNK_SIZE, 2), dtype=np.float32)
+                        
+                        # Check audio level
+                        audio_level = float(np.abs(audio_data).mean())
+                        
+                        if audio_level > MIN_AUDIO_LEVEL:
+                            _last_audio_time = time.time()
+                        
+                        # Convert and send
+                        pcm_audio = np.clip(audio_data, -1.0, 1.0)
+                        pcm_audio = (pcm_audio * 32767).astype(np.int16)
+                        
+                        if _system_stream and not _stream_closed:
+                            try:
+                                _system_stream.write(pcm_audio.tobytes())
+                            except Exception as e:
+                                logger.error(f"❌ Stream write failed: {e}")
+                                _stream_closed = True
+                                break
+                        
+                        time.sleep(0.001)
+                        
+                    except Exception as e:
+                        logger.error(f"🎧 Inner capture error: {e}")
+                        time.sleep(0.1)
+                        break
+                
+                _is_streaming = False
+                
+                if not _stop_system_audio and _stream_closed:
+                    logger.info("🔄 Stream closed, restarting...")
+                    _forced_restart = True
+                    break
+                
+        except Exception as e:
+            logger.error(f"🎧 Outer capture error: {e}")
+            _is_streaming = False
+            
+            _device_recovery_count += 1
+            if _device_recovery_count > 10:
+                break
+            
+            wait_time = min(1.0 * (2 ** _device_recovery_count), 10.0)
+            logger.info(f"🔄 Recovery attempt {_device_recovery_count} in {wait_time:.1f}s...")
+            time.sleep(wait_time)
+    
+    logger.info("🎧 Audio capture engine stopped")
+
+# ================= EVENT HANDLERS =================
+def _setup_speech_handlers(recognizer, on_text):
+    """Setup speech recognition event handlers - WITH DUPLICATE PREVENTION"""
+    
+    def recognizing_handler(evt):
+        if evt.result.reason == speechsdk.ResultReason.RecognizingSpeech:
+            text = evt.result.text.strip()
+            if text and not state.mute_system:
+                current_time = time.time()
+                cleaned_text = _clean_system_text(text)
+                
+                # 🔥 CHECK FOR DUPLICATES
+                if _is_system_duplicate(cleaned_text, is_final=False, current_time=current_time):
+                    logger.debug(f"💻 Skipping duplicate system partial: {cleaned_text}")
+                    return
+                
+                logger.info(f"💻 System (partial): {cleaned_text}")
+                if on_text:
+                    try:
+                        on_text(cleaned_text, is_final=False)
+                    except Exception as e:
+                        logger.error(f"💻 Partial callback error: {e}")
+    
+    def recognized_handler(evt):
+        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+            text = evt.result.text.strip()
+            if text and not state.mute_system:
+                current_time = time.time()
+                cleaned_text = _clean_system_text(text)
+                
+                # 🔥 CHECK FOR DUPLICATES
+                if _is_system_duplicate(cleaned_text, is_final=True, current_time=current_time):
+                    logger.info(f"💻 Skipping duplicate system final: {cleaned_text}")
+                    return
+                
+                logger.info(f"💻 System (final): {cleaned_text}")
+                if on_text:
+                    try:
+                        on_text(cleaned_text, is_final=True)
+                    except Exception as e:
+                        logger.error(f"💻 Final callback error: {e}")
+    
+    def session_started_handler(evt):
+        global _system_active, _recognizer_ready
+        with _system_lock:
+            _system_active = True
+            _recognizer_ready = True
+        logger.info("💻 Speech session STARTED")
+    
+    def session_stopped_handler(evt):
+        global _system_active, _recognizer_ready
+        with _system_lock:
+            _system_active = False
+            _recognizer_ready = False
+        
+        logger.warning(f"💻 Speech session STOPPED")
+        
+        if not state.mute_system and not _stop_system_audio:
+            logger.info("🔄 Auto-restarting session in 1 second...")
+            threading.Timer(1.0, _restart_speech_session, args=[on_text]).start()
+    
+    def canceled_handler(evt):
+        if evt.reason == speechsdk.CancellationReason.Error:
+            error_details = evt.error_details if hasattr(evt, 'error_details') else 'No details'
+            logger.error(f"💻 Recognition ERROR: {error_details}")
+            
+            if not state.mute_system and not _stop_system_audio:
+                logger.info("🔄 Auto-restarting after error in 2 seconds...")
+                threading.Timer(2.0, _restart_speech_session, args=[on_text]).start()
+    
+    recognizer.recognizing.connect(recognizing_handler)
+    recognizer.recognized.connect(recognized_handler)
+    recognizer.session_started.connect(session_started_handler)
+    recognizer.session_stopped.connect(session_stopped_handler)
+    recognizer.canceled.connect(canceled_handler)
+
+def _restart_speech_session(on_text):
+    """Restart speech recognition session"""
+    global _system_recognizer, _system_stream
+    global _system_last_final_text, _system_partial_buffer, _system_final_history, _system_partial_history
+    
+    if state.mute_system or _stop_system_audio:
+        return
+    
+    logger.info("🔧 Restarting speech session...")
+    
+    try:
+        if _system_recognizer:
+            try:
+                _system_recognizer.stop_continuous_recognition()
+            except:
+                pass
+        
+        if _system_stream:
+            try:
+                _system_stream.close()
+            except:
+                pass
+        
+        # Reset duplicate tracking
+        with _system_processing_lock:
+            _system_last_final_text = ""
+            _system_partial_buffer = ""
+            _system_final_history.clear()
+            _system_partial_history.clear()
+        
+        time.sleep(0.5)
+        
+        recognizer, stream = _create_speech_recognizer()
+        _setup_speech_handlers(recognizer, on_text)
+        
+        _system_recognizer = recognizer
+        _system_stream = stream
+        
+        recognizer.start_continuous_recognition()
+        logger.info("✅ Speech session restarted")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to restart speech: {e}")
+        if not state.mute_system and not _stop_system_audio:
+            threading.Timer(3.0, _restart_speech_session, args=[on_text]).start()
+
+# ================= HEALTH MONITOR =================
+def _health_monitor():
+    """Monitor system audio health"""
+    logger.info("❤️ Starting health monitor...")
+    
+    while not _stop_system_audio:
+        try:
+            time.sleep(10.0)
+            
+            with _system_lock:
+                recognizer_alive = _system_recognizer is not None and _system_active
+                capture_alive = _is_streaming
+                time_since_audio = time.time() - _last_audio_time
+            
+            if not state.mute_system and not _stop_system_audio:
+                if not recognizer_alive:
+                    logger.warning(f"⚠️ Recognizer not alive")
+                elif not capture_alive:
+                    logger.warning(f"⚠️ Capture stopped")
+                elif time_since_audio > 60.0:
+                    logger.warning(f"⚠️ No audio for {time_since_audio:.0f}s")
+            
+        except Exception as e:
+            logger.error(f"❤️ Health monitor error: {e}")
+            time.sleep(10.0)
+    
+    logger.info("❤️ Health monitor stopped")
+
+# ================= PUBLIC API =================
+def start_system_stt(speech_config, on_text):
+    """Start system audio STT"""
+    global _system_recognizer, _system_stream, _system_active
+    global _system_audio_thread, _stop_system_audio, _health_monitor_thread
+    global _system_last_final_text, _system_partial_buffer, _system_final_history, _system_partial_history
+    
+    logger.info("🚀 Starting system audio STT...")
+    
+    _stop_system_audio = False
+    
+    try:
+        state.speech_config = speech_config
+        
+        # Reset duplicate tracking
+        with _system_processing_lock:
+            _system_last_final_text = ""
+            _system_partial_buffer = ""
+            _system_final_history.clear()
+            _system_partial_history.clear()
+        
+        recognizer, stream = _create_speech_recognizer()
+        _setup_speech_handlers(recognizer, on_text)
+        
+        _system_recognizer = recognizer
+        _system_stream = stream
+        
+        recognizer.start_continuous_recognition()
+        
+        with _system_lock:
+            _system_active = True
+        
+        logger.info("✅ Speech recognizer started")
+        
+        if _system_audio_thread is None or not _system_audio_thread.is_alive():
+            _system_audio_thread = threading.Thread(
+                target=_audio_capture_engine,
+                daemon=True,
+                name="SystemAudioCapture"
+            )
+            _system_audio_thread.start()
+            logger.info("✅ Audio capture engine started")
+        
+        if _health_monitor_thread is None or not _health_monitor_thread.is_alive():
+            _health_monitor_thread = threading.Thread(
+                target=_health_monitor,
+                daemon=True,
+                name="SystemHealthMonitor"
+            )
+            _health_monitor_thread.start()
+            logger.info("✅ Health monitor started")
+        
+        return recognizer
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to start system STT: {e}")
+        
+        if not state.mute_system:
+            logger.info("🔄 Auto-retry in 5 seconds...")
+            threading.Timer(5.0, lambda: start_system_stt(speech_config, on_text)).start()
+        
+        raise e
+
+def stop_system_recognition():
+    """Stop system audio recognition"""
+    global _system_recognizer, _system_stream, _system_active
+    global _system_audio_thread, _stop_system_audio, _health_monitor_thread
+    global _system_last_final_text, _system_partial_buffer, _system_final_history, _system_partial_history
+    
+    logger.info("🛑 Stopping system audio...")
+    
+    _stop_system_audio = True
+    
+    if _system_recognizer:
+        try:
+            _system_recognizer.stop_continuous_recognition()
+        except:
+            pass
+        _system_recognizer = None
+    
+    if _system_stream:
+        try:
+            _system_stream.close()
+        except:
+            pass
+        _system_stream = None
+    
+    # Reset duplicate tracking
+    with _system_processing_lock:
+        _system_last_final_text = ""
+        _system_partial_buffer = ""
+        _system_final_history.clear()
+        _system_partial_history.clear()
+    
+    with _system_lock:
+        _system_active = False
+    
+    logger.info("✅ System audio stopped")
+
+def force_refresh():
+    """Force refresh system audio"""
+    if state.mute_system:
+        return False
+    
+    logger.info("🔧 Force refreshing system audio...")
+    
+    global _system_recognizer
+    if _system_recognizer:
+        try:
+            _system_recognizer.stop_continuous_recognition()
+            logger.info("✅ Triggered refresh")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to trigger refresh: {e}")
+    
+    return False
+
+def send_keepalive():
+    """Manually send keep-alive packet - SIMPLIFIED"""
+    try:
+        if _system_stream and not _stream_closed:
+            # Create silent audio
+            silent_chunk = np.zeros((CHUNK_SIZE, 2), dtype=np.float32)
+            silent_pcm = (silent_chunk * 32767).astype(np.int16).tobytes()
+            _system_stream.write(silent_pcm)
+            logger.debug("🔧 Keep-alive sent")
+            return True
+    except Exception as e:
+        logger.warning(f"🔧 Keep-alive failed: {e}")
+    
+    return False
+
+def test_system_audio():
+    """Test if system audio is working"""
+    try:
+        speaker = _find_best_speaker()
+        if speaker:
+            return {"success": True, "speaker": speaker.name}
+        else:
+            return {"success": False, "error": "No speaker found"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def get_system_status():
+    """Get detailed system status"""
+    with _system_lock:
+        current_time = time.time()
+        time_since_audio = current_time - _last_audio_time
+        
+        with _system_processing_lock:
+            return {
+                "active": _system_active,
+                "recognizer_exists": _system_recognizer is not None,
+                "capture_running": _is_streaming,
+                "current_speaker": _current_speaker.name if _current_speaker else None,
+                "muted": state.mute_system,
+                "seconds_since_audio": time_since_audio,
+                "recovery_count": _device_recovery_count,
+                "stop_requested": _stop_system_audio,
+                "stream_closed": _stream_closed,
+                "last_final_text": _system_last_final_text,
+                "partial_buffer": _system_partial_buffer,
+                "final_history_count": len(_system_final_history),
+                "partial_history_count": len(_system_partial_history),
+                "timestamp": current_time
+            }
+
+# Simple test
+if __name__ == "__main__":
+    print("System Audio STT Module")
+    print("Functions available:")
+    print("- start_system_stt(speech_config, on_text)")
+    print("- stop_system_recognition()")
+    print("- get_system_status()")
+    print("- force_refresh()")
+    print("- send_keepalive()")
+    print("- test_system_audio()")import mysql.connector
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+def get_db():
+    """Get a fresh database connection with proper cleanup"""
+    return mysql.connector.connect(
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT")),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+        autocommit=True,
+        buffered=True  # Add this to prevent unread result issues
+    )
+
+def init_db():
+    """Initialize database tables with proper cleanup"""
+    try:
+        db = get_db()
+        cur = db.cursor()
+        
+        # Create sessions table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            company VARCHAR(255),
+            job_description TEXT,
+            resume_text LONGTEXT,
+            extra_context TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        
+        # Create qa_messages table
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS qa_messages (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            session_id BIGINT,
+            role ENUM('question','answer'),
+            content LONGTEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+        """)
+        
+        cur.close()
+        db.close()
+        print("✅ MySQL tables initialized")
+        
+    except mysql.connector.Error as err:
+        print(f"❌ Database initialization error: {err}")
+        raise err# app/db/json_encoder.py
+import json
+from datetime import datetime, date, time
+from decimal import Decimal
+
+class DateTimeEncoder(json.JSONEncoder):
+    """Custom JSON encoder for datetime objects"""
+    def default(self, obj):
+        if isinstance(obj, (datetime, date, time)):
+            return obj.isoformat()
+        elif isinstance(obj, Decimal):
+            return float(obj)
+        elif hasattr(obj, '__dict__'):
+            return obj.__dict__
+        return super().default(obj)
+
+def json_serializable(data):
+    """Convert data to JSON serializable format"""
+    if isinstance(data, dict):
+        return {k: json_serializable(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [json_serializable(item) for item in data]
+    elif isinstance(data, (datetime, date, time)):
+        return data.isoformat()
+    elif isinstance(data, Decimal):
+        return float(data)
+    elif hasattr(data, 'strftime'):
+        return data.strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        return data# app/db/qa_repo.py
+from .connection import get_db
+from datetime import datetime
+
+def save_message(session_id, role, content):
+    """Save a Q/A message to database"""
+    db = get_db()
+    cur = db.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO qa_messages (session_id, role, content)
+            VALUES (%s, %s, %s)
+        """, (session_id, role, content))
+        
+        db.commit()
+        print(f"💾 Saved message: session={session_id}, role={role}")
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        cur.close()
+        db.close()
+
+
+def get_recent_history(session_id, limit=6):
+    """Get recent Q/A history for a session"""
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+
+    try:
+        cur.execute("""
+            SELECT role, content, created_at
+            FROM qa_messages
+            WHERE session_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (session_id, limit))
+
+        rows = cur.fetchall()
+        
+        # Convert datetime objects to strings
+        for row in rows:
+            if 'created_at' in row and row['created_at']:
+                if isinstance(row['created_at'], datetime):
+                    row['created_at'] = row['created_at'].isoformat()
+                elif hasattr(row['created_at'], 'strftime'):
+                    row['created_at'] = row['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Reverse to get chronological order
+        return rows[::-1]
+    finally:
+        cur.close()
+        db.close()# reset_db.py
+import mysql.connector
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+def reset_database():
+    """Drop and recreate all tables"""
+    try:
+        # Connect to MySQL server
+        conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST"),
+            port=int(os.getenv("DB_PORT")),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME")
+        )
+        
+        cursor = conn.cursor()
+        
+        print("🗑️ Dropping existing tables...")
+        
+        # Drop tables in correct order (due to foreign key constraints)
+        cursor.execute("DROP TABLE IF EXISTS qa_messages")
+        cursor.execute("DROP TABLE IF EXISTS sessions")
+        
+        # Create sessions table
+        print("📋 Creating sessions table...")
+        cursor.execute("""
+        CREATE TABLE sessions (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            company VARCHAR(255) NOT NULL,
+            job_description TEXT NOT NULL,
+            resume_text LONGTEXT NOT NULL,
+            extra_context TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        # Create qa_messages table
+        print("📋 Creating qa_messages table...")
+        cursor.execute("""
+        CREATE TABLE qa_messages (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            session_id BIGINT NOT NULL,
+            role ENUM('question','answer') NOT NULL,
+            content LONGTEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print("✅ Database reset successfully!")
+        
+    except mysql.connector.Error as err:
+        print(f"❌ Database reset error: {err}")
+        raise err
+
+if __name__ == "__main__":
+    reset_database()from dataclasses import dataclass
+from datetime import datetime
+
+@dataclass
+class Session:
+    id: int
+    company: str
+    job_description: str
+    resume_text: str
+    extra_context: str
+    created_at: datetime
+
+@dataclass
+class QAMessage:
+    id: int
+    session_id: int
+    role: str  # 'question' or 'answer'
+    content: str
+    created_at: datetime# app/db/session_repo.py
+from .connection import get_db
+from datetime import datetime
+
+def create_session(company, jd, resume, extra):
+    """Create a new session and return the session ID"""
+    db = get_db()
+    cur = db.cursor()
+
+    try:
+        cur.execute("""
+            INSERT INTO sessions (company, job_description, resume_text, extra_context)
+            VALUES (%s, %s, %s, %s)
+        """, (company, jd, resume, extra))
+
+        session_id = cur.lastrowid
+        db.commit()
+        
+        print(f"✅ Session created: ID={session_id}, Company={company}")
+        return session_id
+        
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        cur.close()
+        db.close()
+
+
+def get_session(session_id):
+    """Get a session by ID"""
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+
+    try:
+        cur.execute("SELECT * FROM sessions WHERE id = %s", (session_id,))
+        row = cur.fetchone()
+        
+        # Convert datetime to string for JSON serialization
+        if row and 'created_at' in row and row['created_at']:
+            if isinstance(row['created_at'], datetime):
+                row['created_at'] = row['created_at'].isoformat()
+            elif hasattr(row['created_at'], 'strftime'):
+                row['created_at'] = row['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+                
+        return row
+    finally:
+        cur.close()
+        db.close()
+
+
+def get_all_sessions():
+    """Get all sessions ordered by date"""
+    db = get_db()
+    cur = db.cursor(dictionary=True)
+    
+    try:
+        cur.execute("""
+            SELECT id, company, job_description, created_at 
+            FROM sessions 
+            ORDER BY created_at DESC
+        """)
+        
+        rows = cur.fetchall()
+        
+        # Convert datetime objects to strings for JSON serialization
+        for row in rows:
+            if 'created_at' in row and row['created_at']:
+                if isinstance(row['created_at'], datetime):
+                    row['created_at'] = row['created_at'].isoformat()
+                elif hasattr(row['created_at'], 'strftime'):
+                    row['created_at'] = row['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+        
+        return rows
+    finally:
+        cur.close()
+        db.close()
+
+
+def delete_session(session_id):
+    """Delete a session and its Q/A history"""
+    db = get_db()
+    cur = db.cursor()
+    
+    try:
+        # Delete Q/A messages first (due to foreign key constraint)
+        cur.execute("DELETE FROM qa_messages WHERE session_id = %s", (session_id,))
+        # Then delete the session
+        cur.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+        db.commit()
+        return True
+    except Exception as e:
+        db.rollback()
+        raise e
+    finally:
+        cur.close()
+        db.close()# setup_db.py
+import mysql.connector
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+def setup_database():
+    """Create database and tables"""
+    try:
+        # Connect to MySQL server
+        conn = mysql.connector.connect(
+            host=os.getenv("DB_HOST"),
+            port=int(os.getenv("DB_PORT")),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD")
+        )
+        
+        cursor = conn.cursor()
+        
+        # Create database if not exists
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS {os.getenv('DB_NAME')}")
+        print(f"✅ Database '{os.getenv('DB_NAME')}' created or already exists")
+        
+        # Switch to database
+        cursor.execute(f"USE {os.getenv('DB_NAME')}")
+        
+        # Create sessions table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            company VARCHAR(255) NOT NULL,
+            job_description TEXT NOT NULL,
+            resume_text LONGTEXT NOT NULL,
+            extra_context TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_company (company),
+            INDEX idx_created_at (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        # Create qa_messages table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS qa_messages (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            session_id BIGINT NOT NULL,
+            role ENUM('question','answer') NOT NULL,
+            content LONGTEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            INDEX idx_session_id (session_id),
+            INDEX idx_created_at (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        cursor.close()
+        conn.close()
+        
+        print("✅ Tables created successfully")
+        
+    except mysql.connector.Error as err:
+        print(f"❌ Database setup error: {err}")
+        raise err
+
+if __name__ == "__main__":
+    setup_database()import os
+import threading
+import time
+import json
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from dotenv import load_dotenv
+import azure.cognitiveservices.speech as speechsdk
+from openai import AzureOpenAI
+import html 
+
+# Import modules
+from app.audio.mic_stt import start_mic_stt, get_mic_status
+from app.audio.system_stt import start_system_stt, get_system_status
+from app.shared.state import state
+from app.ai.prompt_builder import build_interview_prompt
+
+# Import database modules
+from app.db.connection import init_db
+from app.db.session_repo import create_session, get_all_sessions, get_session, delete_session
+from app.db.qa_repo import save_message, get_recent_history
+
+load_dotenv()
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Azure OpenAI client
+client = AzureOpenAI(
+    api_key=os.getenv("AZURE_OPENAI_KEY"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version="2024-02-15-preview"
+)
+DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+
+# Speech config
+speech_config = speechsdk.SpeechConfig(
+    subscription=os.getenv("AZURE_SPEECH_KEY"),
+    region=os.getenv("AZURE_SPEECH_REGION"),
+)
+speech_config.speech_recognition_language = os.getenv("AZURE_SPEECH_LANGUAGE", "en-US")
+
+# Initialize database
+try:
+    init_db()
+    print("✅ Database initialized")
+except Exception as e:
+    print(f"⚠️ Database warning: {e}")
+
+# Global session state
+current_session_id = None
+session_data = {
+    'company': '',
+    'job_description': '',
+    'resume_text': '',
+    'extra_context': ''
+}
+
+# Add these global variables at the top of your main.py
+_last_processed_mic_text = ""
+_last_processed_system_text = ""
+_last_processed_time = 0
+# Store speech config in state
+state.speech_config = speech_config
+
+# ================= AUDIO CALLBACK WIRING =================
+def on_mic_text(text, is_final=True):
+    """Handle microphone text - WITH DUPLICATE PREVENTION"""
+    if text and text.strip():
+        text = text.strip()
+        
+        global _last_processed_mic_text, _last_processed_time
+        current_time = time.time()
+        
+        # 🔥 DUPLICATE PREVENTION: Skip if same text within 300ms
+        if text == _last_processed_mic_text and (current_time - _last_processed_time) < 0.3:
+            print(f"🔄 Skipping duplicate mic text: '{text}'")
+            return
+        
+        print(f"🎤 Mic callback: '{text}' (final: {is_final})")
+        
+        # Update tracking
+        _last_processed_mic_text = text
+        _last_processed_time = current_time
+        
+        # Process through state
+        state.process_stt_text("mic", text, is_final)
+
+def on_system_text(text, is_final=True):
+    """Handle system audio text - WITH DUPLICATE PREVENTION"""
+    if text and text.strip():
+        text = text.strip()
+        
+        global _last_processed_system_text, _last_processed_time
+        current_time = time.time()
+        
+        # 🔥 DUPLICATE PREVENTION: Skip if same text within 300ms
+        if text == _last_processed_system_text and (current_time - _last_processed_time) < 0.3:
+            print(f"🔄 Skipping duplicate system text: '{text}'")
+            return
+        
+        print(f"💻 System callback: '{text}' (final: {is_final})")
+        
+        # Update tracking
+        _last_processed_system_text = text
+        _last_processed_time = current_time
+        
+        # Process through state
+        state.process_stt_text("system", text, is_final)
+
+# ================= DATABASE ENDPOINTS =================
+@app.post("/api/session/create")
+async def create_new_session(request: Request):
+    try:
+        data = await request.json()
+        
+        company = data.get("company", "").strip()
+        job_description = data.get("job_description", "").strip()
+        resume_text = data.get("resume_text", "").strip()
+        extra_context = data.get("extra_context", "").strip()
+        
+        if not company:
+            raise HTTPException(status_code=400, detail="Company is required")
+        if not job_description:
+            raise HTTPException(status_code=400, detail="Job Description is required")
+        if not resume_text:
+            raise HTTPException(status_code=400, detail="Resume Text is required")
+        
+        global current_session_id, session_data
+        current_session_id = create_session(company, job_description, resume_text, extra_context)
+        
+        session_data = {
+            'company': company,
+            'job_description': job_description,
+            'resume_text': resume_text,
+            'extra_context': extra_context
+        }
+        
+        print(f"✅ Session created: ID={current_session_id}")
+        
+        return JSONResponse({
+            "success": True,
+            "session_id": current_session_id,
+            "message": "Session created successfully"
+        })
+        
+    except Exception as e:
+        print(f"❌ Session creation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/session/list")
+async def list_sessions():
+    try:
+        sessions = get_all_sessions()
+        return JSONResponse({"success": True, "sessions": sessions})
+    except Exception as e:
+        print(f"❌ Error fetching sessions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/session/{session_id}")
+async def get_session_by_id(session_id: int):
+    try:
+        session = get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        history = get_recent_history(session_id, limit=20)
+        
+        return JSONResponse({
+            "success": True,
+            "session": session,
+            "history": history
+        })
+    except Exception as e:
+        print(f"❌ Error fetching session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/session/{session_id}")
+async def delete_session_by_id(session_id: int):
+    try:
+        delete_session(session_id)
+        return JSONResponse({"success": True, "message": "Session deleted"})
+    except Exception as e:
+        print(f"❌ Error deleting session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/session/{session_id}/message")
+async def add_session_message(session_id: int, request: Request):
+    try:
+        data = await request.json()
+        role = data.get("role")
+        content = data.get("content", "").strip()
+        
+        if role not in ['question', 'answer'] or not content:
+            raise HTTPException(status_code=400, detail="Invalid role or content")
+        
+        save_message(session_id, role, content)
+        
+        return JSONResponse({"success": True, "message": "Message saved"})
+    except Exception as e:
+        print(f"❌ Error saving message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ================= SSE: TRANSCRIPT STREAM (ULTRA FAST) =================
+@app.get("/stream")
+def stream():
+    """Stream transcript updates - ULTRA FAST RESPONSE"""
+    def gen():
+        last_sent_line = ""
+        last_partial = ""
+        last_sent_time = 0
+        
+        while True:
+            try:
+                # 🔥 ULTRA FAST: Check for updates every 5ms
+                state.update_event.wait(timeout=0.005)
+                state.update_event.clear()
+                
+                # Get current state
+                text_data = state.get_text_for_sse()
+                
+                current_line = text_data["current_line"]
+                partial_buffer = text_data["partial_buffer"]
+                last_source = text_data["last_source"]
+                has_partial = text_data["has_partial"]
+                timestamp = text_data["timestamp"]
+                
+                # 🔥 FIX: Skip if same text was just sent
+                current_time = time.time()
+                
+                # 🔥 RULE 1: Send FINAL text IMMEDIATELY when it changes
+                if current_line and current_line != last_sent_line:
+                    # Skip if same line was sent within 50ms
+                    if current_time - last_sent_time > 0.05:
+                        data = {
+                            'type': 'transcript', 
+                            'text': current_line, 
+                            'source': last_source or "unknown",
+                            'is_final': True,
+                            'timestamp': timestamp
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+                        last_sent_line = current_line
+                        last_partial = ""
+                        last_sent_time = current_time
+                
+                # 🔥 RULE 1: Send PARTIAL text IMMEDIATELY for real-time feedback
+                elif has_partial and partial_buffer and partial_buffer != last_partial:
+                    # Skip if same partial was sent within 30ms
+                    if current_time - last_sent_time > 0.03:
+                        data = {
+                            'type': 'transcript', 
+                            'text': partial_buffer, 
+                            'source': last_source or "unknown",
+                            'is_final': False,
+                            'is_partial': True,
+                            'timestamp': timestamp
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+                        last_partial = partial_buffer
+                        last_sent_time = current_time
+                
+                # 🔥 ULTRA FAST: Minimal sleep for immediate response
+                time.sleep(0.001)
+                
+            except Exception as e:
+                print(f"❌ SSE Generator Error: {e}")
+                time.sleep(0.01)
+    
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+def format_ai_response_bullets(response_text):
+    """Format AI response with professional bullet points AND code blocks"""
+    response_text = response_text.strip()
+    if not response_text:
+        return ""
+    
+    # Split into lines for processing
+    lines = response_text.split('\n')
+    formatted_lines = []
+    in_code_block = False
+    current_code_block = []
+    code_language = ""
+    
+    for line in lines:
+        # Check for code block start
+        if line.strip().startswith('```'):
+            if not in_code_block:
+                # Starting a code block
+                in_code_block = True
+                # Extract language if specified
+                lang_part = line.strip()[3:].strip()
+                code_language = lang_part if lang_part else 'text'
+            else:
+                # Ending a code block
+                in_code_block = False
+                # Create the code block HTML
+                code_content = '\n'.join(current_code_block).strip()
+                code_html = f'''
+                <div class="chatgpt-code-block">
+                    <div class="code-header">
+                        <span class="code-language">{code_language}</span>
+                        <button class="copy-button" onclick="copyCodeToClipboard(this)">Copy code</button>
+                    </div>
+                    <pre><code class="language-{code_language}">{html.escape(code_content)}</code></pre>
+                </div>
+                '''
+                formatted_lines.append(code_html)
+                current_code_block = []
+                code_language = ""
+            continue
+        
+        if in_code_block:
+            # Collect code block content
+            current_code_block.append(line)
+        else:
+            # Regular text processing
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check for bullet markers
+            if line.startswith(('-', '•', '*', '1.', '2.', '3.', '4.', '5.')):
+                # Clean bullet formatting
+                clean_line = line.lstrip('-•* 1234567890.').strip()
+                if clean_line:
+                    formatted_lines.append(f'<div class="bullet-item">• {html.escape(clean_line)}</div>')
+            else:
+                # Check for inline code (backticks)
+                if '`' in line:
+                    # Simple inline code handling
+                    parts = line.split('`')
+                    if len(parts) >= 3:
+                        line = parts[0] + '<code class="inline-code">' + html.escape(parts[1]) + '</code>' + parts[2]
+                
+                # Add as regular paragraph if it looks like content
+                if line and len(line) > 1:
+                    formatted_lines.append(f'<div class="text-paragraph">{html.escape(line)}</div>')
+    
+    # Build the final result
+    result = ""
+    in_bullet_list = False
+    
+    for line in formatted_lines:
+        if 'bullet-item' in line:
+            if not in_bullet_list:
+                result += '<div class="bullet-list">'
+                in_bullet_list = True
+            result += line
+        else:
+            if in_bullet_list:
+                result += '</div>'
+                in_bullet_list = False
+            result += line
+    
+    # Close any open bullet list
+    if in_bullet_list:
+        result += '</div>'
+    
+    # If nothing was formatted, return the original text with basic formatting
+    if not result:
+        result = f'<div class="text-paragraph">{html.escape(response_text)}</div>'
+    
+    return result
+
+# ================= AI ANSWER ENDPOINT =================
+ # Make sure this is imported at the top of your file
+
+@app.post("/api/answer-stream")
+async def answer_with_context_stream(request: Request):
+    """Handle AI answer generation with streaming"""
+    try:
+        body = await request.json()
+        question = body.get("text", "").strip()
+        
+        if not question:
+            return JSONResponse({"error": "Empty question", "success": False})
+        
+        print(f"🤖 AI Question: '{question}'")
+        
+        # 🔥 RULE 3: Prepare for AI response
+        state.reset_for_answer_button(question)
+        
+        async def generate():
+            try:
+                # Get history if session exists
+                history = []
+                if current_session_id:
+                    history = get_recent_history(current_session_id, limit=5)
+                    print(f"📖 Loaded {len(history)} previous messages")
+                
+                # 🔥 RULE 8: Build interview-specific prompt
+                prompt = build_interview_prompt(session_data, question, history)
+                print(f"📝 Prompt built ({len(prompt)} chars)")
+                
+                # Save question to database
+                if current_session_id:
+                    save_message(current_session_id, "question", question)
+                
+                # Send start signal
+                yield f"data: {json.dumps({'type': 'ai_start', 'message': 'AI is generating answer...'})}\n\n"
+                
+                # Get AI response with streaming
+                stream = client.chat.completions.create(
+                    model=DEPLOYMENT,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=1000,
+                    stream=True
+                )
+                
+                full_response = ""
+                chunk_buffer = ""
+                
+                for chunk in stream:
+                    if chunk.choices and len(chunk.choices) > 0:
+                        delta = chunk.choices[0].delta
+                        if hasattr(delta, 'content') and delta.content:
+                            content = delta.content
+                            full_response += content
+                            chunk_buffer += content
+                            
+                            # 🔥 Send formatted chunks when buffer is large enough
+                            if len(chunk_buffer) >= 80:  # Send chunks of about 80 chars
+                                # Format this chunk for display
+                                formatted_chunk = format_ai_response_bullets(chunk_buffer)
+                                if formatted_chunk:
+                                    yield f"data: {json.dumps({'type': 'ai_chunk', 'content': formatted_chunk})}\n\n"
+                                chunk_buffer = ""
+                
+                # Send any remaining chunk (formatted)
+                if chunk_buffer:
+                    formatted_chunk = format_ai_response_bullets(chunk_buffer)
+                    if formatted_chunk:
+                        yield f"data: {json.dumps({'type': 'ai_chunk', 'content': formatted_chunk})}\n\n"
+                
+                print(f"✅ AI response complete: {len(full_response)} chars")
+                
+                # Save complete response (plain text)
+                if current_session_id:
+                    save_message(current_session_id, "answer", full_response)
+                
+                # Send final complete formatted response
+                final_formatted = format_ai_response_bullets(full_response)
+                yield f"data: {json.dumps({'type': 'ai_complete', 'content': final_formatted})}\n\n"
+                
+                # 🔥 RULE 3: Mark AI response complete and prepare for next question
+                state.complete_ai_response(full_response)
+                
+            except Exception as e:
+                error_msg = str(e)
+                print(f"❌ AI Streaming Error: {error_msg}")
+                
+                # Send error and reset state
+                state.is_ai_responding = False
+                yield f"data: {json.dumps({'type': 'ai_error', 'error': error_msg})}\n\n"
+        
+        return StreamingResponse(generate(), media_type="text/event-stream")
+        
+    except Exception as e:
+        print(f"❌ POST request error: {e}")
+        return JSONResponse({"error": str(e), "success": False})
+# ================= CLEAR BUTTON ENDPOINT =================
+@app.post("/api/clear-and-reset")
+async def clear_and_reset(request: Request):
+    """Clear current text and start fresh listening"""
+    try:
+        print("🔄 Clear button clicked - Starting fresh")
+        
+        state.reset_for_clear_button()
+        
+        return JSONResponse({
+            "success": True,
+            "message": "Fresh listening started",
+            "timestamp": time.time()
+        })
+        
+    except Exception as e:
+        print(f"❌ Error clearing: {e}")
+        return JSONResponse({"success": False, "error": str(e)})
+
+# ================= CHAT BOX ENDPOINT =================
+@app.post("/api/chat-question")
+async def chat_question(request: Request):
+    """Handle chat box question entry"""
+    try:
+        body = await request.json()
+        question = body.get("text", "").strip()
+        
+        if not question:
+            return JSONResponse({"error": "Empty question", "success": False})
+        
+        print(f"💬 Chat box question: '{question}'")
+        
+        # Clear state for fresh start
+        state.reset_for_clear_button()
+        
+        # Set question as current line
+        state.process_stt_text("chat", question, is_final=True)
+        
+        return JSONResponse({
+            "success": True,
+            "message": "Question received",
+            "question": question,
+            "timestamp": time.time()
+        })
+        
+    except Exception as e:
+        print(f"❌ Chat question error: {e}")
+        return JSONResponse({"success": False, "error": str(e)})
+
+# ================= AUDIO MANAGEMENT =================
+def start_audio_services():
+    """Start audio services on startup"""
+    print("🎧 Starting audio services...")
+    print(f"   Mic: {'UNMUTED' if not state.mute_mic else 'MUTED (UI only)'}")
+    print(f"   System: {'UNMUTED' if not state.mute_system else 'MUTED (UI only)'}")
+    
+    try:
+        # Start system audio
+        start_system_stt(speech_config, on_system_text)
+        print("✅ System STT service started")
+        
+        # Start mic with callback
+        start_mic_stt(on_mic_text)
+        print("✅ Mic STT service started")
+        
+        print("🎧 Audio services initialized")
+        
+    except Exception as e:
+        print(f"❌ Failed to start audio services: {e}")
+        threading.Timer(3.0, start_audio_services).start()
+
+# ================= CONTROL ENDPOINTS =================
+@app.post("/toggle-mic")
+async def toggle_mic():
+    """Toggle microphone"""
+    with state.lock:
+        new_state = not state.mute_mic
+        state.set_mute_state("mic", new_state)
+        status = "MUTED (UI)" if new_state else "UNMUTED"
+        print(f"🎤 Microphone {status}")
+    
+    return JSONResponse({
+        "muted": state.mute_mic,
+        "status": get_mic_status(),
+        "message": f"Microphone {status}"
+    })
+
+@app.post("/toggle-system")
+async def toggle_system():
+    """Toggle system audio"""
+    with state.lock:
+        new_state = not state.mute_system
+        state.set_mute_state("system", new_state)
+        status = "MUTED (UI)" if new_state else "UNMUTED"
+        print(f"💻 System Audio {status}")
+    
+    return JSONResponse({
+        "muted": state.mute_system,
+        "status": get_system_status(),
+        "message": f"System audio {status}"
+    })
+
+# ================= DEBUG & STATUS ENDPOINTS =================
+@app.get("/debug-mic-text")
+def debug_mic_text():
+    """Debug endpoint to test mic text manually"""
+    state.process_stt_text("mic", "TEST MIC TEXT - Hello from microphone", is_final=True)
+    return JSONResponse({
+        "success": True,
+        "message": "Test mic text sent",
+        "current_line": state.current_line
+    })
+
+@app.get("/debug-system-text")
+def debug_system_text():
+    """Debug endpoint to test system text manually"""
+    state.process_stt_text("system", "TEST SYSTEM TEXT - Hello from system", is_final=True)
+    return JSONResponse({
+        "success": True,
+        "message": "Test system text sent",
+        "current_line": state.current_line
+    })
+
+@app.get("/audio-status")
+async def audio_status():
+    """Get complete audio status"""
+    with state.lock:
+        return JSONResponse({
+            "mic": {
+                "muted": state.mute_mic,
+                "details": get_mic_status()
+            },
+            "system": {
+                "muted": state.mute_system,
+                "details": get_system_status()
+            },
+            "state": {
+                "current_line": state.current_line,
+                "partial_buffer": state.partial_buffer,
+                "is_ai_responding": state.is_ai_responding,
+                "last_source": state.last_source
+            }
+        })
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    with state.lock:
+        time_since_last_audio = time.time() - state.last_audio_ts
+        
+        return JSONResponse({
+            "status": "healthy",
+            "database": "connected",
+            "audio": {
+                "mic_muted": state.mute_mic,
+                "system_muted": state.mute_system,
+                "backend_status": "ALWAYS RUNNING"
+            },
+            "transcript": {
+                "current_line": state.current_line,
+                "current_line_length": len(state.current_line),
+                "partial_buffer": state.partial_buffer,
+                "seconds_since_last_audio": round(time_since_last_audio, 1)
+            },
+            "current_session": current_session_id,
+            "ai_responding": state.is_ai_responding
+        })
+
+# ================= STARTUP =================
+@app.on_event("startup")
+def startup():
+    """Startup event"""
+    def delayed_start():
+        time.sleep(2.0)
+        start_audio_services()
+    
+    threading.Thread(target=delayed_start, daemon=True).start()
+    print("🚀 Server started - Audio services starting in 2 seconds...")
+
+# ================= MAIN =================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000, reload=True)<!DOCTYPE html>
+<html lang="en">
+<head>
+  <!-- Azure Speech SDK -->
+  <script src="https://aka.ms/csspeech/jsbrowserpackageraw"></script>
+
+  <meta charset="UTF-8" />
+  <title>Interview Helper – Session Manager</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Root shell (Steps 1–3) -->
+  <div class="window-shell" id="windowShell">
+    <!-- HEADER -->
+    <header class="window-header drag-region">
+      <div class="header-left no-drag">
+        <div class="title-group">
+          <div class="app-title">Interview Helper</div>
+          <div class="subtitle">Session Manager</div>
+        </div>
+      </div>
+
+      <div class="header-center no-drag">
+        <div class="credit-pill">
+          <span>◎</span>
+          <span>free edition</span>
+        </div>
+      </div>
+
+      <div class="header-right no-drag">
+        <div class="window-controls">
+          <button id="btnMin" class="ctrl ctrl-min">–</button>
+          <button id="btnClose" class="ctrl ctrl-close">✕</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- TABS -->
+    <div class="tab-bar">
+      <button class="tab active" data-tab="create">Create</button>
+      <button class="tab" data-tab="history">Past Sessions</button>
+    </div>
+
+    <!-- MAIN CONTENT (hidden completely in Step-4) -->
+    <main class="content">
+      <!-- ====== CREATE TAB ====== -->
+      <div class="tab-panel active" data-panel="create">
+        <!-- STEP 1 -->
+        <section class="step step-1 active step-light">
+          <h2 class="section-title">Select Session Type</h2>
+          <p class="helper-text">Choose how you want to use Interview Helper.</p>
+
+          <div class="session-type-card">
+            <div class="session-info">
+              <div class="session-label">Free session</div>
+              <div class="session-desc">
+                Limited usage, great for trying out the app.
+              </div>
+            </div>
+            <button id="btnFreeSession" class="primary-btn">
+       Start Setup
+</button>
+
+          </div>
+        </section>
+
+
+        <!-- STEP 2 -->
+        <section class="step step-2 step-light">
+          <h2 class="section-title">Job Details</h2>
+          <p class="helper-text">
+            Tell Interview Helper what job you're preparing for.
+          </p>
+
+          <div class="form-group">
+            <label class="field-label">
+              Company <span class="required">*</span>
+            </label>
+            <input
+              id="companyInput"
+              type="text"
+              class="text-input"
+              placeholder="Microsoft…"
+            />
+          </div>
+
+          <div class="form-group">
+            <label class="field-label">
+              Job Description <span class="required">*</span>
+            </label>
+            <textarea
+              id="jobDescInput"
+              class="text-input text-area"
+              placeholder="Software Engineer…"
+            ></textarea>
+          </div>
+
+          <div class="footer-buttons">
+            <button id="btnBack2" class="secondary-btn">Back</button>
+            <button id="btnNext2" class="primary-btn">Next</button>
+          </div>
+        </section>
+
+        <!-- STEP 3 -->
+        <section class="step step-3 step-light">
+          <h2 class="section-title">Session Settings</h2>
+          <p class="helper-text">
+            Configure how the AI should respond. All fields with * are required.
+          </p>
+
+          <div class="form-group">
+            <label class="field-label">
+              Language
+            </label>
+            <select id="languageSelect" class="text-input">
+              <option selected>English</option>
+              <option>Tamil</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label class="field-label">
+              Extra Context / Instructions <span class="required">*</span>
+            </label>
+            <textarea
+              id="contextInput"
+              class="text-input text-area"
+              placeholder="Be more technical, use casual tone, etc."
+              rows="4"
+            ></textarea>
+          </div>
+
+          <div class="form-group">
+            <label class="field-label">
+              Resume Text <span class="required">*</span>
+            </label>
+            <textarea
+              id="resumeText"
+              class="text-input text-area"
+              placeholder="Paste your resume content here..."
+              rows="8"
+            ></textarea>
+          </div>
+
+          <div class="form-group">
+            <label class="field-label">
+              API Provider <span class="required">*</span>
+            </label>
+            <div class="model-row">
+              <button class="pill pill-ghost" type="button" data-provider="azure">
+                Azure OpenAI
+              </button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="field-label">
+              Model <span class="required">*</span>
+            </label>
+            <select id="modelSelect" class="text-input">
+              <option value="gpt-4o-mini" selected>GPT-4o Mini</option>
+              <option value="gpt-4o">GPT-4o</option>
+              <option value="gpt-4-turbo">GPT-4 Turbo</option>
+            </select>
+          </div>
+
+          <div class="footer-buttons">
+            <button id="btnBack3" class="secondary-btn">Back</button>
+            <button id="btnSaveSession" class="secondary-btn">Save</button>
+            <button id="btnCreate" class="primary-btn">
+              Start Free Session
+            </button>
+          </div>
+        </section>
+
+        <!-- Dummy STEP 4 (overlay) -->
+        <section class="step step-4 step-dark"></section>
+      </div>
+
+      <!-- ====== HISTORY TAB ====== -->
+      <div class="tab-panel" data-panel="history">
+        <section>
+          <h2 class="section-title">Past Sessions</h2>
+          <p class="helper-text">
+            Select a saved session to view history and continue chatting.
+          </p>
+
+          <div class="history-layout">
+            <div class="session-list" id="sessionList"></div>
+            <div class="session-detail">
+              <div id="sessionMeta" class="session-meta"></div>
+              <div id="sessionMessages" class="message-list"></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===== STEP 4 GLASS OVERLAY ===== -->
+
+  <!-- Top toolbar (draggable) -->
+  <div id="aiToolbar" class="ai-overlay-bar drag-region">
+    <div class="ai-overlay-left">
+      <button id="btnMicIcon" class="circle-icon is-on no-drag" title="Mic on/off">🎙️</button>
+      <button id="btnSystemIcon" class="circle-icon is-off no-drag" title="System audio on/off">💻</button>
+
+      <button id="toolbarAIHelp" class="pill filled no-drag">AI Help</button>
+      
+      <button id="toolbarChat" class="pill no-drag">Chat</button>
+    </div>
+
+    <div class="ai-overlay-right">
+      <span id="toolbarDuration" class="aihelp-clock no-drag">Listening 00:00</span>
+      <button id="btnToolbarCancel" class="square-icon no-drag">Cancel</button>
+      <button id="toolbarCollapse" class="square-icon no-drag">˅</button>
+    </div>
+  </div>
+
+  <!-- Q&A glass panel -->
+  <div id="aiPanel" class="ai-panel" data-open="false">
+    <div class="ai-panel-header">
+      <span class="ai-panel-title">AI Help</span>
+    </div>
+
+   <div class="control-row">
+    <button id="btnAnswer" class="primary-btn small">Answer</button>
+    <button id="btnClear" class="secondary-btn small">Clear Text</button>
+    <button id="btnBackToSettings" class="secondary-btn small">Back</button>
+    <span id="durationLabel" class="aihelp-clock">Listening 00:00</span>
+</div>
+
+    <div class="qa-card">
+      <div class="qa-question-row">
+        <span class="qa-label-question">Question:</span>
+        <p id="qaQuestion" class="qa-question-text">
+          Listening…
+        </p>
+      </div>
+
+      <div class="qa-answer-row">
+        <span class="qa-label-answer">Answer:</span>
+        <div id="qaAnswer" class="qa-answer"></div>
+      </div>
+
+      <div class="qa-footer">
+        <span>AI Help · </span>
+        <span id="qaTime">Duration 00:00</span>
+      </div>
+    </div>
+
+    <div class="chat-row" id="chatRow">
+      <input
+        id="chatInput"
+        class="chat-input"
+        type="text"
+        placeholder="Type your question here and press Enter…"
+      />
+      <button id="chatSend" class="primary-btn small">Send</button>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+  <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAHVSURBVHgB7dqxS9tRFMfxT5PVQNpc3CaLSBcHcQrUjv0DnCq4dGgROpQOQQp1bBUE8S8QCh3rP9DBwRyKoLh1aKGDCCEdSvP6ejkERB2SPH3e930fPyBcIAT57nv33j13F0mSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSpKyJhT6APLg4XYp/CX0QeQq4Wj3Tun3Vj8PZy5GAq9WjeHJxmpJm6INYr9H/9PRtf3nu65AA1yU2Z8Lciz/j8PvA20//Kg0mWv+c3v/29K5v3I0NWg3//7VpfgogSZKkLDAQEgKBkBAIhIRAIJgHAAHCTAEoBEDgGEBgeGJp1m3QlTIAEARa/wzH/v35Z/51JwSC6gUAQcC5gBBQn1AAgMA9oFEIhIJAoBmJQJ2AgWYk9IMABppmgICAsRVAQNA6BIy9AgSEnwICghbA9AMAAM1CAIBmZQDQ6H+AUd0KIAIAzZwAQDMrgIAN8AAGum6DQKMOEAQDAQI2aAIBQeMQCASCVsCAt0GXK4CAgOZlwL8CCAgYEAKBQCAIBAKQ1RBYGj5uDoSMQDA5BKL7i9PG2+Pb1gOP/6OqA2DqL84a33/Xrvv/3mU8d0Bw99Bo9f+/S3jugODuvtHu/36XLw6fU8UReP4/nff4btoHwN8h8P77XK9F4M+T4LX7/68NAAThv0FA+6+g7AUAYnQINAyAQCDoCAJ+IxL3IOggBIJGIUDgPoAGAQDCCBEA3w6g6zYAn2qMBQDqG5r3/wEl5PGhx7+yzAAAAABJRU5ErkJggg==">
+</body>
+</html>// Logo as base64 (Interview Helper Logo)
+const LOGO_BASE64 = `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAI2SURBVHgB7du/SxVBFMDxI66+8A8QQVAQDNHAoL/hj4yIhIaoqIMLoiBYSGghESLqQnCRIFiI5gJ3ERJBsBA1f3L1vYV74V3I57nJZ97nA5f7dnYPs7+ZubOz18wYY4wxxhhjjDHGGGOMMcYYY4wxJipV+AOoU3WNVGXeT83Rdk2P/0bNobzU6r8DqMHKNf0KVy1qvhclhOJq5KzGPn2X+RgBlFArZzQe3Iu8rI8AZql7Mxp7Nf/pqCzBQyio6s5oPJvReLOv9+LlAuAhFFY1ezX/0t/X7fZ9X4KHUGDtG9z8tC+49+7mh3w5BiG/AfKrlbPxfam6i3tuJ9d3AQ8hL1rV7DEbT3MI2U+BDyFP2nR22HeRfHt/oE/Ikw5u/eo7eA9+6G/kPXvJj3kJ5HqvebDXe/OjnPzE18C7nN36i6Kd/NQ3Qb3+47/BTZ3Kq+hL57z/e+tyN6eT72TqTfC8Xv+1yGl9z+f5L+BzwMfQTnz9qjY+TJX8Tq5/+CqwF/k6+a0QboN+vx1BdeJj3xz/DPHwm8AnwPPIn8iX0T+Q/5Ivf4d4G9R7ga8R/5If0Px5vV+gfQF+DfD8xzj/17QX+lWRJuBp3d5AXBz55k/lI+BB6FdFkYCnN4Cc3u3tn0d+A+wED4J2TeAZ4n4oJz+gp+DeCHIEuA34r0L3gKd1elP5A7jPzc8ngBPAJ8B1gN+LXgTt2j0Q9zG2L78JegjsBswG+O2Ih6Bdszv7A7v4s38U/Ax4GriV3vyCQ9Cuzs52qVebk7/JvS87PwT+BJwLtPn/Bb3nqEPQzssRwHqZJ78UuvE38hJ4KfCGV+z+LCHVxN7Qk1+G0u/PElJN7I1i89pKvT9LSDWxN4rNayv1/izhH4PzcgLwSgibn8PH4FZ9/x5C3v33/ZlKz9Pn5e+K3/P8eY3n7/Oa/wDTUcZhBKEosQAAAABJRU5ErkJggg==`;
+
+// Alternative simpler logo
+const SIMPLE_LOGO = `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAIISURBVHgB7doxSxxRFMDxY1dRkAh2YmmljY0hWCQWgiTYZWPnpxAL09gIYhFBW8HOVhD8GCaNRTo7CwvxGygiohvu/HYea2EjJ3M5d5/3e8BdHrw7L/fuf87s7szMzMzMzMzMzMzMzMzMzMzMLE0ZRrQqG9Q+hjXqGfM2YV/XoZJEXEYMqaK2H+kVdZf5O6ygNAGYVtMrtUfdYH5PXXMwAi1g0z87/J7gYIwfQ9D/d7M1LItYAeQg/wf3OMr/GcPaxgKQ9d4w6N+0YDYoyQoIADF+7o9O1Y5/fwYIAGF/Nf3g1/VPAz6MhR8GgLQ85R2fBkgBQAoAUgCQAoAUAKQAYBSATgLQFYAOAtDmAFQANKEBUOVp/CQAiSY6AAoZgI7Gp7kjrH8A9Pd+cz8KQJvH/M5mAlBFSH4Hw3vLqQagqNt9DYB2O9u3dd1uBrAC9J8N6v9b5/Y/aAWE2n8VQ1t/Yts2Vn2uAm3b7WQ1dZUBKGPgHesr6yG2ALqZ27a1ip4wtsd1/dv8KphnAa5Te9QZ9YU6pXaoD9Ta9n1eNfUA7M9nK3v3+V1mzQfggLE+UbBvB69lIQUAqX8C0I/JxQqIvgIkACAFACkASAFACgBSAJACgBQApAAgBQApAEgBQAoAUgCQAoAUAKQAYFYAOReAZQBYAYBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgPkBaFYAlglgGQCWAWAZAOYHoFkBgGUAlgFYBmB+AK6bmZmZWe9mZmZmZmZmZmZmZmZmZmbWx/oEpsWf3wBmW7kAAAAASUVORK5CYII=`;
+
+// Export logos
+module.exports = {
+    LOGO_BASE64,
+    SIMPLE_LOGO
+};const { LOGO_BASE64 } = require('./logo.js');
+
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, screen } = require('electron');
+const path = require('path');
+const { spawn } = require('child_process');
+
+let mainWindow = null;
+let circleWindow = null;
+let tray = null;
+let pythonServer = null;
+let isMinimized = false;
+
+function createWindow() {
+    mainWindow = new BrowserWindow({
+        width: 800,
+        height: 600,
+        minWidth: 780,
+        minHeight: 550,
+        frame: false,
+        transparent: true,
+        backgroundColor: '#00000000',
+        show: true,
+
+        // ✅ VISIBLE in taskbar & Alt-Tab
+        skipTaskbar: false,
+
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js')
+        }
+    });
+
+    // 🔓 ALLOW screen sharing / recording
+    mainWindow.setContentProtection(false);
+
+    mainWindow.loadFile('index.html');
+
+    createTray();
+    startBackend();
+
+    ipcMain.on('minimize-window', minimizeToCircle);
+    ipcMain.on('close-window', () => app.quit());
+    ipcMain.on('restore-window', restoreFromCircle);
+
+    ipcMain.on('move-circle', (event, x, y) => {
+        if (circleWindow) {
+            circleWindow.setPosition(x, y);
+        }
+    });
+}
+
+function createCircleWindow(x, y) {
+    if (circleWindow) {
+        circleWindow.focus();
+        return circleWindow;
+    }
+
+    circleWindow = new BrowserWindow({
+        width: 60,
+        height: 60,
+        x,
+        y,
+        frame: false,
+        transparent: true,
+        backgroundColor: '#00000000',
+        alwaysOnTop: true,
+
+        // ❌ Circle hidden from taskbar (normal behavior)
+        skipTaskbar: true,
+
+        resizable: false,
+        movable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        show: false,
+
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            preload: path.join(__dirname, 'preload.js')
+        }
+    });
+
+    // 🔓 Allow capture
+    circleWindow.setContentProtection(false);
+
+    circleWindow.loadFile('circle.html');
+    circleWindow.setIgnoreMouseEvents(false);
+
+    circleWindow.on('closed', () => {
+        circleWindow = null;
+    });
+
+    return circleWindow;
+}
+
+function minimizeToCircle() {
+    if (!mainWindow) return;
+
+    mainWindow.hide();
+    mainWindow.setSkipTaskbar(true);
+    isMinimized = true;
+
+    const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+    const circleX = width - 100;
+    const circleY = height - 100;
+
+    const circleWin = createCircleWindow(circleX, circleY);
+    circleWin.show();
+    circleWin.focus();
+}
+
+function restoreFromCircle() {
+    if (!mainWindow) return;
+
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.setSkipTaskbar(false);
+    isMinimized = false;
+
+    if (circleWindow) {
+        circleWindow.hide();
+    }
+}
+
+function createTray() {
+    const icon = nativeImage.createFromDataURL(LOGO_BASE64);
+    tray = new Tray(icon);
+
+    const contextMenu = Menu.buildFromTemplate([
+        {
+            label: 'Show Interview Helper',
+            click: () => isMinimized ? restoreFromCircle() : mainWindow.show()
+        },
+        {
+            label: 'Minimize to Circle',
+            click: minimizeToCircle
+        },
+        { type: 'separator' },
+        {
+            label: 'Quit',
+            click: () => app.quit()
+        }
+    ]);
+
+    tray.setToolTip('Interview Helper');
+    tray.setContextMenu(contextMenu);
+
+    tray.on('click', () => {
+        if (isMinimized) restoreFromCircle();
+        else mainWindow.show();
+    });
+}
+
+function startBackend() {
+    const pythonPath = process.platform === 'win32' ? 'python' : 'python3';
+    const scriptPath = path.join(__dirname, 'main.py');
+
+    pythonServer = spawn(pythonPath, [scriptPath]);
+
+    pythonServer.stdout.on('data', d => console.log(`Backend: ${d}`));
+    pythonServer.stderr.on('data', d => console.error(`Backend Error: ${d}`));
+}
+
+app.whenReady().then(createWindow);
+
+app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+        if (pythonServer) pythonServer.kill();
+        app.quit();
+    }
+});
+
+app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+    }
+});
+
+app.on('before-quit', () => {
+    if (pythonServer) pythonServer.kill();
+    if (circleWindow) circleWindow.close();
+});
+{
+  "name": "interview-assistant",
+  "version": "1.0.0",
+  "description": "Interview Helper AI Assistant",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --debug",
+    "build": "electron-builder"
+  },
+  "dependencies": {
+    "electron": "^25.0.0"
+  },
+  "devDependencies": {
+    "electron-builder": "^24.6.4"
+  },
+  "build": {
+    "appId": "com.interviewhelper.private",
+    "productName": "Interview Helper",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
+      "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
+      "!**/node_modules/*.d.ts",
+      "!**/*.iml",
+      "!circle.html"  
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "assets/icon.icns"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "author": "",
+  "license": "MIT"
+}const { contextBridge, ipcRenderer } = require('electron');
+
+// For main window (index.html)
+contextBridge.exposeInMainWorld('api', {
+    askAI: (text) => {
+        return fetch('http://127.0.0.1:8000/answer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text })
+        });
+    },
+    toggleMic: () => {
+        return fetch('http://127.0.0.1:8000/toggle-mic', { method: 'POST' });
+    },
+    toggleSystem: () => {
+        return fetch('http://127.0.0.1:8000/toggle-system', { method: 'POST' });
+    }
+});
+
+// For BOTH windows
+contextBridge.exposeInMainWorld('electronAPI', {
+    // For main window
+    minimizeWindow: () => ipcRenderer.send('minimize-window'),
+    closeWindow: () => ipcRenderer.send('close-window'),
+    
+    // For circle window
+    restoreWindow: () => ipcRenderer.send('restore-window'),
+    moveCircle: (x, y) => ipcRenderer.send('move-circle', x, y)
+});function setupWindowControls() {
+    // Minimize button
+    const btnMin = document.getElementById('btnMin');
+    if (btnMin) {
+        btnMin.addEventListener('click', (e) => {
+            e.preventDefault();
+            console.log('🔘 Minimize button clicked');
+            
+            if (window.electronAPI && window.electronAPI.minimizeWindow) {
+                window.electronAPI.minimizeWindow();
+            }
+        });
+    }
+    
+    // Close button
+    const btnClose = document.getElementById('btnClose');
+    if (btnClose) {
+        btnClose.addEventListener('click', (e) => {
+            e.preventDefault();
+            console.log('🔘 Close button clicked');
+            
+            if (window.electronAPI && window.electronAPI.closeWindow) {
+                window.electronAPI.closeWindow();
+            }
+        });
+    }
+
+}
+// renderer.js - COMPLETE WORKING VERSION WITH DUPLICATE PREVENTION
+document.addEventListener("DOMContentLoaded", function() {
+    console.log("🚀 Interview Helper Frontend Initializing...");
+    
+    // ================= GLOBAL STATE =================
+    let sseConnection = null;
+    let currentTranscript = "";
+    let micMuted = false;  // Mic starts UNMUTED
+    let systemMuted = false;
+    let isAiResponding = false;
+    let sessionTimer = null;
+    let sessionStartTime = null;
+    let currentSessionId = null;
+    let isSessionActive = false;
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 10;
+    
+    // 🔥 DUPLICATE PREVENTION TRACKING
+    let lastProcessedText = "";
+    let lastProcessedTime = 0;
+    let lastPartialText = "";
+    let lastFinalText = "";
+    let duplicateBlockList = new Set();
+    
+    // ================= ELEMENTS =================
+    const qaQuestion = document.getElementById("qaQuestion");
+    const qaAnswer = document.getElementById("qaAnswer");
+    const btnAnswer = document.getElementById("btnAnswer");
+    const btnClear = document.getElementById("btnClear");
+    const btnMic = document.getElementById("btnMicIcon");
+    const btnSystem = document.getElementById("btnSystemIcon");
+    const btnBackToSettings = document.getElementById("btnBackToSettings");
+    const btnToolbarCancel = document.getElementById("btnToolbarCancel");
+    const btnCollapse = document.getElementById("toolbarCollapse");
+    const durationLabel = document.getElementById("durationLabel");
+    const toolbarDuration = document.getElementById("toolbarDuration");
+    
+    // Form elements
+    const companyInput = document.getElementById("companyInput");
+    const jobDescInput = document.getElementById("jobDescInput");
+    const resumeText = document.getElementById("resumeText");
+    const contextInput = document.getElementById("contextInput");
+    
+    // Tab elements
+    const tabs = document.querySelectorAll(".tab");
+    const tabPanels = document.querySelectorAll(".tab-panel");
+    
+    // Chat elements
+    const chatInput = document.getElementById("chatInput");
+    const btnSendChat = document.getElementById("chatSend");
+    const toolbarChat = document.getElementById("toolbarChat");
+    const chatRow = document.getElementById("chatRow");
+    
+    // Session elements
+    const sessionList = document.getElementById("sessionList");
+    const sessionMeta = document.getElementById("sessionMeta");
+    const sessionMessages = document.getElementById("sessionMessages");
+    
+ // ================= STATUS UPDATES =================
+function updateAudioStatus() {
+    // Update button states
+    if (btnMic) {
+        btnMic.classList.toggle("is-on", !micMuted);
+        btnMic.classList.toggle("is-off", micMuted);
+        btnMic.title = micMuted ? "Mic OFF (backend running)" : "Mic ON";
+    }
+    
+    if (btnSystem) {
+        btnSystem.classList.toggle("is-on", !systemMuted);
+        btnSystem.classList.toggle("is-off", systemMuted);
+        btnSystem.title = systemMuted ? "System OFF (backend running)" : "System ON";
+    }
+    
+    // Update toolbar status
+    const micStatus = micMuted ? "OFF" : "ON";
+    const sysStatus = systemMuted ? "OFF" : "ON";
+    
+    if (toolbarDuration) {
+        toolbarDuration.textContent = `🎤 ${micStatus} | 💻 ${sysStatus}`;
+    }
+    
+    // 🔥 UPDATE Q/A PANEL INDICATORS NEAR CLEAR BUTTON
+    updateQAPanelIndicators(micMuted, systemMuted);
+}
+
+// 🔥 NEW FUNCTION: Update indicators near Clear button
+function updateQAPanelIndicators(isMicMuted, isSystemMuted) {
+    const micIndicator = document.getElementById("micIndicator");
+    const systemIndicator = document.getElementById("systemIndicator");
+    const micIndicatorText = document.getElementById("micIndicatorText");
+    const systemIndicatorText = document.getElementById("systemIndicatorText");
+    
+    if (micIndicator) {
+        if (isMicMuted) {
+            micIndicator.classList.add("muted");
+            micIndicator.title = "Microphone: OFF";
+            if (micIndicatorText) micIndicatorText.textContent = "OFF";
+        } else {
+            micIndicator.classList.remove("muted");
+            micIndicator.title = "Microphone: ON";
+            if (micIndicatorText) micIndicatorText.textContent = "ON";
+        }
+    }
+    
+    if (systemIndicator) {
+        if (isSystemMuted) {
+            systemIndicator.classList.add("muted");
+            systemIndicator.title = "System Audio: OFF";
+            if (systemIndicatorText) systemIndicatorText.textContent = "OFF";
+        } else {
+            systemIndicator.classList.remove("muted");
+            systemIndicator.title = "System Audio: ON";
+            if (systemIndicatorText) systemIndicatorText.textContent = "ON";
+        }
+    }
+}
+    // ================= SESSION TIMER =================
+   function startSessionTimer() {
+    if (sessionTimer) clearInterval(sessionTimer);
+    sessionStartTime = Date.now();
+    
+    sessionTimer = setInterval(() => {
+        // 🔥 REQUIREMENT 2: Update toolbar duration
+        updateToolbarDuration();
+        
+        // Remove duration from Q/A panel (REQUIREMENT 4)
+        if (durationLabel) {
+            durationLabel.textContent = ""; // Empty instead of "Listening XX:XX"
+        }
+        
+    }, 1000); // Update every second
+}
+    
+    function stopSessionTimer() {
+        if (sessionTimer) {
+            clearInterval(sessionTimer);
+            sessionTimer = null;
+        }
+    }
+    
+    // ================= DUPLICATE DETECTION =================
+    function isDuplicateText(existingText, newText) {
+        if (!existingText || !newText) return false;
+        
+        const existingLower = existingText.toLowerCase().trim();
+        const newLower = newText.toLowerCase().trim();
+        
+        // Exact match
+        if (existingLower === newLower) return true;
+        
+        // Check if new text is in block list
+        if (duplicateBlockList.has(newLower)) {
+            return true;
+        }
+        
+        // If new text is contained in existing text
+        if (existingLower.includes(newLower)) {
+            const existingWords = existingLower.split(/\s+/);
+            const newWords = newLower.split(/\s+/);
+            
+            // If new text is 1-3 words and appears at the end of existing text
+            if (newWords.length <= 3) {
+                const lastExistingWords = existingWords.slice(-newWords.length).join(' ');
+                if (lastExistingWords === newWords.join(' ')) {
+                    duplicateBlockList.add(newLower);
+                    setTimeout(() => duplicateBlockList.delete(newLower), 1000);
+                    return true;
+                }
+            }
+        }
+        
+        // Check for consecutive word repetition
+        const words = newLower.split(/\s+/);
+        if (words.length === 2 && words[0] === words[1]) {
+            duplicateBlockList.add(newLower);
+            setTimeout(() => duplicateBlockList.delete(newLower), 1000);
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // ================= SSE CONNECTION =================
+    function connectSSE() {
+        if (sseConnection) {
+            console.log("🔄 Closing existing SSE connection");
+            sseConnection.close();
+            sseConnection = null;
+        }
+        
+        console.log("🔄 Connecting to SSE stream...");
+        
+        try {
+            sseConnection = new EventSource("http://127.0.0.1:8000/stream");
+            
+            sseConnection.onopen = () => {
+                console.log("✅ SSE connection established");
+                reconnectAttempts = 0;
+            };
+            
+            sseConnection.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === "transcript") {
+                        handleTranscript(data);
+                    } else if (data.type === "ai_start") {
+                        console.log("🤖 AI started generating...");
+                        qaAnswer.innerHTML = '<div class="thinking">AI is generating answer...</div>';
+                    } else if (data.type === "ai_chunk") {
+                        console.log("🤖 AI chunk received");
+                        qaAnswer.innerHTML = data.content;
+                        scrollToBottom();
+                    } else if (data.type === "ai_complete") {
+                        console.log("✅ AI response complete");
+                        isAiResponding = false;
+                        btnAnswer.disabled = false;
+                        qaAnswer.innerHTML = data.content;
+                        scrollToBottom();
+                        
+                        // Clear for next question after AI completes
+                        setTimeout(() => {
+                            qaQuestion.textContent = "Listening for next question...";
+                            qaQuestion.classList.remove("partial-text");
+                            currentTranscript = "";
+                            lastProcessedText = "";
+                            lastPartialText = "";
+                            lastFinalText = "";
+                            duplicateBlockList.clear();
+                        }, 500);
+                    } else if (data.type === "ai_error") {
+                        console.error("❌ AI error:", data.error);
+                        qaAnswer.innerHTML = `<div class="error">AI Error: ${data.error}</div>`;
+                        isAiResponding = false;
+                        btnAnswer.disabled = false;
+                    }
+                } catch (error) {
+                    console.error("❌ SSE parse error:", error);
+                }
+            };
+            
+            sseConnection.onerror = (error) => {
+                console.error("❌ SSE connection error:", error);
+                
+                if (sseConnection) {
+                    sseConnection.close();
+                    sseConnection = null;
+                }
+                
+                reconnectAttempts++;
+                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                    console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                    setTimeout(connectSSE, 1000);
+                } else {
+                    console.error("❌ Max reconnection attempts reached");
+                    if (qaQuestion) {
+                        qaQuestion.textContent = "Connection lost. Please refresh.";
+                    }
+                }
+            };
+            
+        } catch (error) {
+            console.error("❌ Failed to create SSE connection:", error);
+            setTimeout(connectSSE, 1000);
+        }
+    }
+    
+    // ================= TRANSCRIPT HANDLING =================
+   // ================= TRANSCRIPT HANDLING =================
+function handleTranscript(data) {
+    const text = data.text.trim();
+    if (!text) {
+        console.log("⚠️ Empty text in transcript");
+        return;
+    }
+    
+    const currentTime = Date.now();
+    
+    // 🔥 DUPLICATE PREVENTION: Skip if same text within 300ms
+    if (text === lastProcessedText && (currentTime - lastProcessedTime) < 300) {
+        console.log(`🔄 Skipping immediate duplicate: "${text}"`);
+        return;
+    }
+    
+    lastProcessedText = text;
+    lastProcessedTime = currentTime;
+    
+    console.log(`📥 ${data.source}: "${text}" (final: ${data.is_final})`);
+    
+    // Check if source is muted in UI
+    if (data.source === "mic" && micMuted) {
+        console.log("🔇 Mic muted in UI - ignoring");
+        return;
+    }
+    if (data.source === "system" && systemMuted) {
+        console.log("🔇 System muted in UI - ignoring");
+        return;
+    }
+    
+    // Immediate text display
+    if (data.is_final) {
+        // 🔥 Clear partial tracking
+        lastPartialText = "";
+        
+        // 🔥 CRITICAL FIX: REPLACE instead of ACCUMULATE
+        // Check if this is a continuation or a new sentence
+        const endsWithPunctuation = /[.!?]$/.test(currentTranscript.trim());
+        const startsWithCapital = /^[A-Z]/.test(text.trim());
+        
+        // If current transcript ends with punctuation AND new text starts with capital,
+        // it's likely a new sentence - replace completely
+        if (endsWithPunctuation && startsWithCapital) {
+            currentTranscript = text;
+        } 
+        // If it's a continuation (no punctuation), add it
+        else if (!endsWithPunctuation && !startsWithCapital && currentTranscript) {
+            // But only if it's not a duplicate
+            if (!isDuplicateText(currentTranscript, text)) {
+                currentTranscript += " " + text;
+            }
+        }
+        // Otherwise, replace with new text
+        else {
+            currentTranscript = text;
+        }
+        
+        qaQuestion.textContent = currentTranscript;
+        qaQuestion.classList.remove("partial-text");
+        
+        // 🔥 Track last final
+        lastFinalText = text;
+        
+        console.log(`✅ Final transcript: "${currentTranscript}"`);
+        
+    } else if (data.is_partial) {
+        // 🔥 Skip duplicate partials
+        if (text === lastPartialText) {
+            return;
+        }
+        lastPartialText = text;
+        
+        // Partial text - show as preview (replace, don't accumulate)
+        qaQuestion.textContent = text;
+        qaQuestion.classList.add("partial-text");
+        
+        console.log(`↗️ Partial preview: "${text}"`);
+    }
+    
+    scrollToBottom();
+}
+    // ================= CHAT BOX FUNCTIONALITY =================
+    function setupChatBox() {
+        if (!toolbarChat || !chatRow || !chatInput) {
+            console.log("⚠️ Chat elements not found");
+            return;
+        }
+        
+        console.log("💬 Setting up chat box functionality...");
+        
+        // Show/hide chat box when chat button is clicked
+        toolbarChat.addEventListener("click", function(e) {
+            e.stopPropagation();
+            
+            // Toggle chat box visibility
+            const isVisible = chatRow.style.display === "flex";
+            chatRow.style.display = isVisible ? "none" : "flex";
+            
+            // If showing, focus the input
+            if (!isVisible) {
+                setTimeout(() => {
+                    chatInput.focus();
+                    chatInput.select();
+                }, 100);
+            }
+            
+            // Update button appearance
+            toolbarChat.classList.toggle("active", !isVisible);
+            
+            console.log(`💬 Chat box ${isVisible ? 'hidden' : 'shown'}`);
+        });
+        
+        // Send chat question when Enter key is pressed
+        chatInput.addEventListener("keypress", function(e) {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendChatQuestion();
+            }
+        });
+        
+        // Send chat question when Send button is clicked
+        if (btnSendChat) {
+            btnSendChat.addEventListener("click", function() {
+                sendChatQuestion();
+            });
+        }
+        
+        // Close chat box when clicking outside
+        document.addEventListener("click", function(e) {
+            if (chatRow.style.display === "flex" && 
+                !chatRow.contains(e.target) && 
+                e.target !== toolbarChat &&
+                !toolbarChat.contains(e.target)) {
+                chatRow.style.display = "none";
+                toolbarChat.classList.remove("active");
+            }
+        });
+        
+        console.log("✅ Chat box setup complete");
+    }
+    
+    // ================= SEND CHAT QUESTION =================
+    async function sendChatQuestion() {
+        if (!chatInput || !chatInput.value.trim()) {
+            alert("Please enter a question");
+            return;
+        }
+        
+        const question = chatInput.value.trim();
+        console.log(`💬 Sending chat question: "${question}"`);
+        
+        try {
+            // Show sending indicator
+            const originalAnswer = qaAnswer.innerHTML;
+            qaAnswer.innerHTML = '<div class="thinking">Sending question...</div>';
+            
+            // Send question to backend
+            const response = await fetch("http://127.0.0.1:8000/api/chat-question", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: question })
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                // Clear input and hide chat box
+                chatInput.value = "";
+                chatRow.style.display = "none";
+                toolbarChat.classList.remove("active");
+                
+                // Update UI with the question
+                currentTranscript = question;
+                qaQuestion.textContent = question;
+                qaQuestion.classList.remove("partial-text");
+                
+                console.log("✅ Chat question sent successfully");
+                
+                // Automatically trigger AI answer after a short delay
+                setTimeout(() => {
+                    handleAnswerButton();
+                }, 500);
+            }
+        } catch (error) {
+            console.error("❌ Chat question failed:", error);
+            qaAnswer.innerHTML = '<div class="error">Failed to send question. Please try again.</div>';
+            alert(`Failed to send question: ${error.message}`);
+        }
+    }
+    
+    // ================= TOGGLE BUTTONS =================
+    async function toggleMic() {
+        console.log("🎤 Toggling microphone...");
+        
+        try {
+            const response = await fetch("http://127.0.0.1:8000/toggle-mic", {
+                method: "POST"
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            
+            micMuted = data.muted;
+            updateAudioStatus();
+            
+            console.log(`✅ Mic ${micMuted ? 'muted' : 'unmuted'}`);
+            
+            // Clear text when unmuting for fresh start
+            if (!micMuted) {
+                console.log("🔄 Mic unmuted - starting FRESH");
+                currentTranscript = "";
+                lastProcessedText = "";
+                lastPartialText = "";
+                lastFinalText = "";
+                duplicateBlockList.clear();
+                
+                qaQuestion.textContent = "Listening...";
+                qaQuestion.classList.remove("partial-text");
+            }
+            
+        } catch (error) {
+            console.error("❌ Toggle mic failed:", error);
+            updateAudioStatus();
+        }
+    }
+    
+    async function toggleSystem() {
+        console.log("💻 Toggling system audio...");
+        
+        try {
+            const response = await fetch("http://127.0.0.1:8000/toggle-system", {
+                method: "POST"
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            
+            systemMuted = data.muted;
+            updateAudioStatus();
+            
+            console.log(`✅ System ${systemMuted ? 'muted' : 'unmuted'}`);
+            
+            // Clear text when unmuting for fresh start
+            if (!systemMuted) {
+                console.log("🔄 System unmuted - starting FRESH");
+                currentTranscript = "";
+                lastProcessedText = "";
+                lastPartialText = "";
+                lastFinalText = "";
+                duplicateBlockList.clear();
+                
+                qaQuestion.textContent = "Listening...";
+                qaQuestion.classList.remove("partial-text");
+            }
+            
+        } catch (error) {
+            console.error("❌ Toggle system failed:", error);
+            updateAudioStatus();
+        }
+    }
+    
+    // ================= ANSWER BUTTON =================
+    // ================= ANSWER BUTTON =================
+async function handleAnswerButton() {
+    // 🔥 REQUIREMENT: Check if text is empty and show alert IN ANSWER AREA
+    if (!currentTranscript.trim()) {
+        console.log("⚠️ No transcript to answer");
+        
+        // Show alert message IN THE ANSWER AREA instead of separate alert box
+        qaAnswer.innerHTML = `
+            <div class="alert-message">
+               
+                    <strong>Please speak or type a question first</strong>
+                
+                
+            </div>
+        `;
+        
+        // Optional: Clear after 3 seconds
+        setTimeout(() => {
+            if (qaAnswer.innerHTML.includes("alert-message")) {
+                qaAnswer.innerHTML = "";
+            }
+        }, 3000);
+        
+        return;
+    }
+    
+    if (isAiResponding) {
+        console.log("⚠️ AI is already responding");
+        return;
+    }
+    
+    const question = currentTranscript.trim();
+    console.log(`🤖 Answering FRESH question: "${question}"`);
+    
+    isAiResponding = true;
+    btnAnswer.disabled = true;
+    
+    // Store question
+    const questionToSend = question;
+    
+    // Clear UI and tracking
+    currentTranscript = "";
+    lastProcessedText = "";
+    lastPartialText = "";
+    lastFinalText = "";
+    duplicateBlockList.clear();
+    
+    qaQuestion.textContent = "Processing question...";
+    qaQuestion.classList.remove("partial-text");
+    
+    qaAnswer.innerHTML = '<div class="thinking">AI is generating interview answer...</div>';
+    
+    try {
+        const response = await fetch("http://127.0.0.1:8000/api/answer-stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: questionToSend })
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        
+        // Handle streaming response
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let aiResponseComplete = false;
+        
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || "";
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        
+                        if (data.type === 'ai_start') {
+                            console.log("🤖 AI started generating...");
+                        }
+                        else if (data.type === 'ai_chunk') {
+                            qaAnswer.innerHTML = data.content;
+                            scrollToBottom();
+                        }
+                        else if (data.type === 'ai_complete') {
+                            console.log("✅ AI response complete");
+                            isAiResponding = false;
+                            btnAnswer.disabled = false;
+                            qaAnswer.innerHTML = data.content;
+                            scrollToBottom();
+                            aiResponseComplete = true;
+                            
+                            // Reset duplicate tracking
+                            lastProcessedText = "";
+                            lastPartialText = "";
+                            lastFinalText = "";
+                            duplicateBlockList.clear();
+                        }
+                        else if (data.type === 'ai_error') {
+                            throw new Error(data.error);
+                        }
+                    } catch (parseError) {
+                        console.warn("⚠️ Could not parse SSE data:", parseError);
+                    }
+                }
+            }
+        }
+        
+        if (!aiResponseComplete) {
+            isAiResponding = false;
+            btnAnswer.disabled = false;
+        }
+        
+    } catch (error) {
+        console.error("❌ AI streaming failed:", error);
+        qaAnswer.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+        isAiResponding = false;
+        btnAnswer.disabled = false;
+    }
+    
+    scrollToBottom();
+}
+    // ================= CLEAR BUTTON =================
+    async function handleClearButton() {
+        console.log("🔄 Clear button clicked - Fresh start");
+        
+        // Clear everything
+        currentTranscript = "";
+        lastProcessedText = "";
+        lastPartialText = "";
+        lastFinalText = "";
+        duplicateBlockList.clear();
+        
+        qaQuestion.textContent = "Listening for new question...";
+        qaQuestion.classList.remove("partial-text");
+        qaAnswer.innerHTML = "";
+        
+        // Hide chat box if open
+        if (chatRow && chatRow.style.display === "flex") {
+            chatRow.style.display = "none";
+            toolbarChat.classList.remove("active");
+        }
+        
+        try {
+            await fetch("http://127.0.0.1:8000/api/clear-and-reset", {
+                method: "POST"
+            });
+            console.log("✅ Fresh start initiated");
+        } catch (error) {
+            console.warn("⚠️ Could not notify backend:", error);
+        }
+    }
+    
+    // ================= DATABASE: SESSION MANAGEMENT =================
+    async function createSession() {
+        const company = companyInput.value.trim();
+        const jobDesc = jobDescInput.value.trim();
+        const resume = resumeText.value.trim();
+        const context = contextInput.value.trim();
+        
+        if (!company || !jobDesc || !resume) {
+            alert("Please fill in all required fields: Company, Job Description, and Resume");
+            return;
+        }
+        
+        console.log("💾 Creating session...");
+        
+        try {
+            const response = await fetch("http://127.0.0.1:8000/api/session/create", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    company: company,
+                    job_description: jobDesc,
+                    resume_text: resume,
+                    extra_context: context
+                })
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                currentSessionId = data.session_id;
+                isSessionActive = true;
+                
+                // Show session UI
+                document.body.classList.add("step4-active");
+                document.getElementById("aiPanel").dataset.open = "true";
+                
+                // Mic starts UNMUTED by default
+                micMuted = false;
+                updateAudioStatus();
+                
+                // Reset all tracking
+                currentTranscript = "";
+                lastProcessedText = "";
+                lastPartialText = "";
+                lastFinalText = "";
+                duplicateBlockList.clear();
+                
+                // Connect SSE
+                connectSSE();
+                
+                // Start timer
+                startSessionTimer();
+                
+                // Update UI
+                qaQuestion.textContent = "Session started! Ask your question...";
+                qaAnswer.innerHTML = "";
+                
+                console.log(`✅ Session started with ID: ${currentSessionId}`);
+                
+                // Force backend to start fresh listening
+                setTimeout(() => {
+                    fetch("http://127.0.0.1:8000/api/clear-and-reset", {
+                        method: "POST"
+                    }).then(() => {
+                        console.log("✅ Backend fresh listening started");
+                    });
+                }, 500);
+                
+            } else {
+                throw new Error(data.error || "Failed to create session");
+            }
+            
+        } catch (error) {
+            console.error("❌ Session creation failed:", error);
+            alert(`Failed to create session: ${error.message}`);
+        }
+    }
+    
+    function stopSession() {
+        console.log("🛑 Stopping session...");
+        
+        isSessionActive = false;
+        
+        // Hide session UI
+        document.body.classList.remove("step4-active");
+        document.getElementById("aiPanel").dataset.open = "false";
+        
+        // Close connections
+        if (sseConnection) {
+            sseConnection.close();
+            sseConnection = null;
+        }
+        
+        // Stop timer
+        stopSessionTimer();
+        
+        // Reset states
+        currentTranscript = "";
+        lastProcessedText = "";
+        lastPartialText = "";
+        lastFinalText = "";
+        duplicateBlockList.clear();
+        currentSessionId = null;
+        
+        // Hide chat box if open
+        if (chatRow && chatRow.style.display === "flex") {
+            chatRow.style.display = "none";
+            toolbarChat.classList.remove("active");
+        }
+        
+        // Update UI
+        if (qaQuestion) {
+            qaQuestion.textContent = "Session ended";
+        }
+        if (qaAnswer) {
+            qaAnswer.innerHTML = "";
+        }
+        
+        console.log("✅ Session stopped");
+    }
+    
+    // ================= DATABASE: LOAD SESSIONS =================
+    async function loadSessions() {
+        try {
+            const response = await fetch("http://127.0.0.1:8000/api/session/list");
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            
+            if (!sessionList) return;
+            
+            if (data.success && data.sessions && data.sessions.length > 0) {
+                sessionList.innerHTML = "";
+                
+                data.sessions.forEach(session => {
+                    const sessionDate = new Date(session.created_at).toLocaleDateString('en-US', {
+                        year: 'numeric',
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                    
+                    const sessionItem = document.createElement("div");
+                    sessionItem.className = "session-item";
+                    sessionItem.innerHTML = `
+                        <div class="session-header">
+                            <strong>${session.company || 'Unnamed Company'}</strong>
+                            <span class="session-date">${sessionDate}</span>
+                        </div>
+                        <div class="session-info">
+                            <div class="session-id">ID: ${session.id}</div>
+                            <div class="job-preview">${session.job_description ? session.job_description.substring(0, 80) + '...' : 'No job description'}</div>
+                        </div>
+                        <div class="session-actions">
+                            <button onclick="loadSessionDetails(${session.id})" class="nav-btn small">View</button>
+                            <button onclick="deleteSession(${session.id})" class="nav-btn small delete-btn">Delete</button>
+                        </div>
+                    `;
+                    sessionList.appendChild(sessionItem);
+                });
+                
+                console.log(`✅ Loaded ${data.sessions.length} sessions`);
+            } else {
+                sessionList.innerHTML = '<div class="empty-state">No sessions found.</div>';
+            }
+        } catch (error) {
+            console.error("❌ Error loading sessions:", error);
+            if (sessionList) {
+                sessionList.innerHTML = `<div class="error-state">Error: ${error.message}</div>`;
+            }
+        }
+    }
+    
+    // ================= DATABASE: LOAD SESSION DETAILS =================
+    window.loadSessionDetails = async function(sessionId) {
+        try {
+            const response = await fetch(`http://127.0.0.1:8000/api/session/${sessionId}`);
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            
+            if (data.success && sessionMeta && sessionMessages) {
+                const createdDate = new Date(data.session.created_at).toLocaleString();
+                
+                // Update session metadata
+                sessionMeta.innerHTML = `
+                    <div class="session-detail-header">
+                        <h3>${data.session.company || 'Unnamed Company'}</h3>
+                        <div class="session-meta-info">
+                            <span class="meta-item">ID: ${data.session.id}</span>
+                            <span class="meta-item">Created: ${createdDate}</span>
+                        </div>
+                    </div>
+                    <div class="session-detail-content">
+                        <div class="detail-section">
+                            <h4>Job Description</h4>
+                            <div class="detail-content">${escapeHtml(data.session.job_description || 'No job description')}</div>
+                        </div>
+                        <div class="detail-section">
+                            <h4>Resume Preview</h4>
+                            <div class="detail-content">${escapeHtml(data.session.resume_text ? data.session.resume_text.substring(0, 300) + '...' : 'No resume')}</div>
+                        </div>
+                        <div class="detail-section">
+                            <h4>Additional Context</h4>
+                            <div class="detail-content">${escapeHtml(data.session.extra_context || 'No context')}</div>
+                        </div>
+                    </div>
+                `;
+                
+                // Update conversation history
+                if (data.history && data.history.length > 0) {
+                    sessionMessages.innerHTML = '<h4>Conversation History</h4>';
+                    
+                    data.history.forEach(msg => {
+                        const msgDiv = document.createElement("div");
+                        msgDiv.className = `msg-row ${msg.role}`;
+                        
+                        const roleIcon = msg.role === 'question' ? '❓' : '🤖';
+                        const roleClass = msg.role === 'question' ? 'user' : 'assistant';
+                        const roleText = msg.role === 'question' ? 'Question' : 'Answer';
+                        
+                        let timeText = '';
+                        if (msg.created_at) {
+                            try {
+                                const date = new Date(msg.created_at);
+                                timeText = date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+                            } catch (e) {
+                                timeText = msg.created_at;
+                            }
+                        }
+                        
+                        msgDiv.innerHTML = `
+                            <div class="msg-header">
+                                <span class="msg-role ${roleClass}">${roleIcon} ${roleText}</span>
+                                <span class="msg-time">${timeText}</span>
+                            </div>
+                            <div class="msg-content">${escapeHtml(msg.content.substring(0, 500) + (msg.content.length > 500 ? '...' : ''))}</div>
+                        `;
+                        sessionMessages.appendChild(msgDiv);
+                    });
+                } else {
+                    sessionMessages.innerHTML = '<div class="empty-state">No conversation history.</div>';
+                }
+                
+                // Load this session into current session
+                loadSessionIntoCurrent(data.session);
+                
+            }
+        } catch (error) {
+            console.error("❌ Error loading session details:", error);
+            if (sessionMessages) {
+                sessionMessages.innerHTML = `<div class="error-state">Error: ${error.message}</div>`;
+            }
+        }
+    };
+    
+    // ================= DATABASE: LOAD SESSION INTO CURRENT =================
+    function loadSessionIntoCurrent(session) {
+        console.log(`📂 Loading session ${session.id} into current session`);
+        
+        // Update form fields
+        if (companyInput) companyInput.value = session.company || '';
+        if (jobDescInput) jobDescInput.value = session.job_description || '';
+        if (resumeText) resumeText.value = session.resume_text || '';
+        if (contextInput) contextInput.value = session.extra_context || '';
+        
+        // Start the session
+        currentSessionId = session.id;
+        isSessionActive = true;
+        
+        // Show session UI
+        document.body.classList.add("step4-active");
+        document.getElementById("aiPanel").dataset.open = "true";
+        
+        // Reset duplicate tracking
+        currentTranscript = "";
+        lastProcessedText = "";
+        lastPartialText = "";
+        lastFinalText = "";
+        duplicateBlockList.clear();
+        
+        // Connect SSE
+        connectSSE();
+        
+        // Start timer
+        startSessionTimer();
+        
+        // Update UI
+        qaQuestion.textContent = `Loaded session: ${session.company || 'Unnamed Company'}`;
+        qaAnswer.innerHTML = "<div class='info'>Session loaded. Ask new questions or continue the conversation.</div>";
+        
+        // Switch to session tab
+        const sessionTab = document.querySelector('[data-tab="session"]');
+        if (sessionTab) sessionTab.click();
+        
+        console.log(`✅ Session ${session.id} loaded successfully`);
+    }
+    
+    // ================= DATABASE: DELETE SESSION =================
+    window.deleteSession = async function(sessionId) {
+        if (!confirm("Are you sure you want to delete this session?")) {
+            return;
+        }
+        
+        try {
+            const response = await fetch(`http://127.0.0.1:8000/api/session/${sessionId}`, {
+                method: "DELETE"
+            });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                // Reload sessions list
+                loadSessions();
+                alert("Session deleted successfully");
+            }
+        } catch (error) {
+            console.error("❌ Error deleting session:", error);
+            alert(`Failed to delete session: ${error.message}`);
+        }
+    };
+    
+    // ================= FORMATTING FUNCTIONS =================
+    function formatAIResponse(text) {
+    // Backend is now formatting the response, so just return as-is
+    // But wrap in a container if it's not already formatted
+    if (text.includes('class="') || text.includes('</div>') || text.includes('<div')) {
+        return text;
+    }
+    return `<div class="ai-response">${escapeHtml(text)}</div>`;
+}
+    
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+    
+    function scrollToBottom() {
+        setTimeout(() => {
+            if (qaAnswer) {
+                qaAnswer.scrollTop = qaAnswer.scrollHeight;
+            }
+            if (qaQuestion) {
+                qaQuestion.scrollTop = qaQuestion.scrollHeight;
+            }
+        }, 100);
+    }
+    
+    // ================= TAB MANAGEMENT =================
+    function setupTabs() {
+        tabs.forEach(tab => {
+            tab.addEventListener("click", () => {
+                // Remove active class from all tabs
+                tabs.forEach(t => t.classList.remove("active"));
+                tabPanels.forEach(p => p.classList.remove("active"));
+                
+                // Add active class to clicked tab
+                tab.classList.add("active");
+                
+                // Show corresponding panel
+                const panelId = tab.getAttribute("data-tab");
+                const panel = document.querySelector(`[data-panel="${panelId}"]`);
+                if (panel) {
+                    panel.classList.add("active");
+                }
+                
+                // If history tab, load sessions
+                if (panelId === "history") {
+                    loadSessions();
+                }
+            });
+        });
+    }
+    
+    // ================= STEP NAVIGATION =================
+    function setupSteps() {
+        const steps = document.querySelectorAll(".step");
+        
+        function showStep(stepNumber) {
+            steps.forEach(step => step.classList.remove("active"));
+            const targetStep = document.querySelector(`.step-${stepNumber}`);
+            if (targetStep) {
+                targetStep.classList.add("active");
+            }
+            
+            if (stepNumber === 4 && isSessionActive) {
+                // Session is already active
+            }
+        }
+        
+        // Step navigation buttons
+        document.getElementById("btnFreeSession")?.addEventListener("click", () => showStep(2));
+        document.getElementById("btnBack2")?.addEventListener("click", () => showStep(1));
+        document.getElementById("btnNext2")?.addEventListener("click", () => showStep(3));
+        document.getElementById("btnBack3")?.addEventListener("click", () => showStep(2));
+        document.getElementById("btnCreate")?.addEventListener("click", createSession);
+        
+        // Save session button (if exists)
+        document.getElementById("btnSaveSession")?.addEventListener("click", async () => {
+            await createSession();
+            alert("Session saved!");
+        });
+    }
+    
+    // ================= EVENT LISTENERS =================
+    // ================= EVENT LISTENERS =================
+function setupEventListeners() {
+    // Audio toggle buttons
+    if (btnMic) {
+        btnMic.addEventListener("click", toggleMic);
+    }
+    if (btnSystem) {
+        btnSystem.addEventListener("click", toggleSystem);
+    }
+    
+    // Action buttons
+    if (btnAnswer) {
+        btnAnswer.addEventListener("click", handleAnswerButton);
+    }
+    if (btnClear) {
+        btnClear.addEventListener("click", handleClearButton);
+    }
+    
+    // 🔥 NEW: Back to session button
+    const btnBackSession = document.getElementById("btnBackSession");
+    if (btnBackSession) {
+        btnBackSession.addEventListener("click", function() {
+            if (isSessionActive) {
+                // Go back to session view
+                document.body.classList.remove("step4-active");
+                document.getElementById("aiPanel").dataset.open = "false";
+                isSessionActive = false;
+                
+                // Reset states
+                currentTranscript = "";
+                lastProcessedText = "";
+                lastPartialText = "";
+                lastFinalText = "";
+                duplicateBlockList.clear();
+                
+                // Close connections
+                if (sseConnection) {
+                    sseConnection.close();
+                    sseConnection = null;
+                }
+                
+                // Stop timer
+                stopSessionTimer();
+                
+                // Update UI
+                if (qaQuestion) {
+                    qaQuestion.textContent = "Session ended";
+                }
+                if (qaAnswer) {
+                    qaAnswer.innerHTML = "";
+                }
+                
+                console.log("✅ Back to session view");
+            }
+        });
+    }
+    
+    // Navigation buttons
+    if (btnBackToSettings) {
+        btnBackToSettings.addEventListener("click", stopSession);
+    }
+    if (btnToolbarCancel) {
+        btnToolbarCancel.addEventListener("click", stopSession);
+    }
+    
+    // Collapse button
+    if (btnCollapse) {
+        btnCollapse.addEventListener("click", () => {
+            const aiPanel = document.getElementById("aiPanel");
+            if (aiPanel) {
+                aiPanel.classList.toggle("collapsed");
+                btnCollapse.textContent = aiPanel.classList.contains("collapsed") ? "˄" : "˅";
+            }
+        });
+    }
+}
+    // ================= CSS STYLES =================
+    function addStyles() {
+        const style = document.createElement('style');
+        style.textContent = `
+            /* IMMEDIATE VISUAL FEEDBACK STYLES */
+            .partial-text {
+                color: #666 !important;
+                font-style: italic !important;
+                opacity: 0.8;
+            }
+            
+            .bullet-item {
+                margin: 6px 0;
+                padding-left: 12px;
+                border-left: 3px solid #4CAF50;
+                line-height: 1.5;
+                animation: fadeIn 0.2s ease-in;
+            }
+            
+            .bullet-list {
+                margin: 12px 0;
+            }
+            
+            .thinking {
+                color: #666;
+                font-style: italic;
+                padding: 12px;
+                background-color: #f5f5f5;
+                border-radius: 6px;
+                animation: pulse 1.5s infinite;
+            }
+            
+            .error {
+                color: #d32f2f;
+                padding: 12px;
+                background-color: #ffebee;
+                border-radius: 6px;
+                border-left: 4px solid #d32f2f;
+                margin: 10px 0;
+            }
+            
+            .info {
+                color: #1976d2;
+                padding: 12px;
+                background-color: #e3f2fd;
+                border-radius: 6px;
+                border-left: 4px solid #1976d2;
+                margin: 10px 0;
+            }
+            
+            /* Session styles */
+            .session-item {
+                padding: 15px;
+                margin-bottom: 10px;
+                background: white;
+                border-radius: 8px;
+                border: 1px solid #e0e0e0;
+                transition: all 0.2s;
+            }
+            
+            .session-item:hover {
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                transform: translateY(-1px);
+            }
+            
+            .session-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 8px;
+            }
+            
+            .session-date {
+                font-size: 12px;
+                color: #666;
+            }
+            
+            .session-info {
+                margin-bottom: 10px;
+            }
+            
+            .session-id {
+                font-size: 12px;
+                color: #888;
+                margin-bottom: 5px;
+            }
+            
+            .job-preview {
+                font-size: 14px;
+                color: #555;
+                line-height: 1.4;
+            }
+            
+            .session-actions {
+                display: flex;
+                gap: 10px;
+                margin-top: 10px;
+            }
+            
+            .nav-btn.small {
+                padding: 4px 12px;
+                font-size: 12px;
+            }
+            
+            .delete-btn {
+                background-color: #f44336;
+            }
+            
+            .delete-btn:hover {
+                background-color: #d32f2f;
+            }
+            
+            .empty-state {
+                text-align: center;
+                padding: 40px 20px;
+                color: #888;
+                font-style: italic;
+            }
+            
+            .error-state {
+                text-align: center;
+                padding: 20px;
+                color: #d32f2f;
+                background-color: #ffebee;
+                border-radius: 6px;
+            }
+            
+            /* ================= CHAT BOX STYLES ================= */
+            #chatRow {
+                display: none; /* Hidden by default */
+                margin-top: 16px;
+                padding: 12px;
+                background: rgba(15, 23, 42, 0.8);
+                border-radius: 12px;
+                border: 1px solid rgba(59, 130, 246, 0.3);
+                backdrop-filter: blur(10px);
+                animation: slideIn 0.3s ease;
+            }
+            
+            #chatInput {
+                flex: 1;
+                padding: 10px 16px;
+                border-radius: 8px;
+                border: 1px solid rgba(148, 163, 184, 0.5);
+                background: rgba(30, 41, 59, 0.7);
+                color: #f9fafb;
+                font-size: 14px;
+                outline: none;
+                transition: all 0.2s;
+            }
+            
+            #chatInput:focus {
+                border-color: #3b82f6;
+                box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+            }
+            
+            #chatSend {
+                background: #3b82f6;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 8px;
+                cursor: pointer;
+                font-weight: 500;
+                transition: all 0.2s;
+            }
+            
+            #chatSend:hover {
+                background: #2563eb;
+                transform: translateY(-1px);
+            }
+            
+            /* Active state for chat button */
+            #toolbarChat.active {
+                background: rgba(59, 130, 246, 0.2);
+                border-color: #3b82f6;
+                color: #3b82f6;
+            }
+            
+            /* ================= CHATGPT CODE BLOCKS ================= */
+            .chatgpt-code-block {
+                margin: 16px 0;
+                background: #0f172a;
+                border-radius: 8px;
+                border: 1px solid #334155;
+                overflow: hidden;
+                font-family: 'SF Mono', Monaco, 'Cascadia Mono', monospace;
+            }
+            
+            .chatgpt-code-block .code-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 12px;
+                background: #1e293b;
+                border-bottom: 1px solid #334155;
+            }
+            
+            .chatgpt-code-block .code-language {
+                color: #94a3b8;
+                font-size: 12px;
+                font-weight: 500;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+            }
+            
+            .chatgpt-code-block .copy-button {
+                background: #3b82f6;
+                color: white;
+                border: none;
+                padding: 4px 12px;
+                border-radius: 4px;
+                font-size: 11px;
+                cursor: pointer;
+                transition: all 0.2s;
+                font-family: 'Inter', sans-serif;
+            }
+            
+            .chatgpt-code-block .copy-button:hover {
+                background: #2563eb;
+                transform: translateY(-1px);
+            }
+            
+            .chatgpt-code-block .copy-button.copied {
+                background: #10b981;
+            }
+            
+            .chatgpt-code-block pre {
+                margin: 0;
+                padding: 0;
+                overflow-x: auto;
+            }
+            
+            .chatgpt-code-block code {
+                display: block;
+                padding: 16px;
+                font-size: 13px;
+                line-height: 1.5;
+                color: #e2e8f0;
+                white-space: pre;
+                tab-size: 4;
+            }
+            
+            /* Syntax highlighting */
+            .chatgpt-code-block .language-python code { color: #7dd3fc; }
+            .chatgpt-code-block .language-javascript code,
+            .chatgpt-code-block .language-js code { color: #fbbf24; }
+            .chatgpt-code-block .language-html code { color: #f87171; }
+            .chatgpt-code-block .language-css code { color: #60a5fa; }
+            .chatgpt-code-block .language-java code { color: #34d399; }
+            .chatgpt-code-block .language-cpp code,
+            .chatgpt-code-block .language-c code { color: #c084fc; }
+            .chatgpt-code-block .language-sql code { color: #c084fc; }
+            .chatgpt-code-block .language-json code { color: #2dd4bf; }
+            .chatgpt-code-block .language-bash code,
+            .chatgpt-code-block .language-shell code { color: #86efac; }
+            .chatgpt-code-block .language-text code { color: #e2e8f0; }
+            
+            /* Inline code */
+            .inline-code {
+                background: rgba(30, 41, 59, 0.7);
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-family: 'SF Mono', monospace;
+                font-size: 13px;
+                color: #fbbf24;
+                border: 1px solid #475569;
+            }
+            
+            /* Text paragraphs */
+            .text-paragraph {
+                margin-bottom: 12px;
+                line-height: 1.6;
+                color: #f9fafb;
+            }
+            
+            /* Bullet points */
+            .bullet-list {
+                margin: 16px 0;
+                padding-left: 0;
+            }
+            
+            .bullet-item {
+                position: relative;
+                padding-left: 24px;
+                margin-bottom: 8px;
+                line-height: 1.5;
+                color: #f9fafb;
+            }
+            
+            .bullet-item:before {
+                content: "•";
+                position: absolute;
+                left: 8px;
+                color: #fde68a;
+                font-size: 16px;
+            }
+            
+            /* Animation for chat box */
+            @keyframes slideIn {
+                from {
+                    opacity: 0;
+                    transform: translateY(-10px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+            
+            @keyframes fadeIn {
+                from { opacity: 0; transform: translateY(5px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            
+            @keyframes pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.7; }
+            }
+            
+            /* Ensure proper overflow */
+            .qa-answer {
+                max-height: 60vh;
+                overflow-y: auto;
+            }
+            
+            .qa-answer::-webkit-scrollbar {
+                width: 8px;
+            }
+            
+            .qa-answer::-webkit-scrollbar-track {
+                background: rgba(30, 41, 59, 0.3);
+                border-radius: 4px;
+            }
+            
+            .qa-answer::-webkit-scrollbar-thumb {
+                background: #475569;
+                border-radius: 4px;
+            }
+            
+            .qa-answer::-webkit-scrollbar-thumb:hover {
+                background: #64748b;
+            }
+        `;
+        document.head.appendChild(style);
+        console.log("✅ Styles added");
+    }
+    // ================= KEYBOARD HOTKEYS =================
+function setupHotkeys() {
+    console.log("⌨️ Setting up keyboard hotkeys...");
+    
+    document.addEventListener('keydown', function(event) {
+        // 🔥 ANSWER BUTTON - Space key
+        if (event.code === 'Space' && !event.repeat && !event.altKey) {
+            console.log("⌨️ Space key pressed - Triggering answer");
+            event.preventDefault();
+            if (btnAnswer && !btnAnswer.disabled) {
+                handleAnswerButton();
+            }
+        }
+        
+        // 🔥 MICROPHONE TOGGLE - M key
+        if (event.code === 'KeyM' && !event.repeat) {
+            console.log("⌨️ M key pressed - Toggling microphone");
+            event.preventDefault();
+            toggleMic();
+        }
+        
+        // 🔥 CLEAR BUTTON - C key
+        if (event.code === 'KeyC' && !event.repeat) {
+            console.log("⌨️ C key pressed - Clearing text");
+            event.preventDefault();
+            if (btnClear) {
+                handleClearButton();
+            }
+        }
+        
+        // 🔥 SYSTEM AUDIO TOGGLE - N key
+        if (event.code === 'KeyN' && !event.repeat) {
+            console.log("⌨️ N key pressed - Toggling system audio");
+            event.preventDefault();
+            toggleSystem();
+        }
+        
+        // 🔥 CHAT BOX TOGGLE - Alt+Space
+        if (event.altKey && event.code === 'Space' && !event.repeat) {
+            console.log("⌨️ Alt+Space pressed - Toggling chat box");
+            event.preventDefault();
+            if (toolbarChat) {
+                toolbarChat.click();
+            }
+        }
+    });
+    
+    console.log("✅ Hotkeys setup complete");
+}
+
+// ================= CODE COPY FUNCTIONALITY =================
+function setupCodeCopyButtons() {
+    document.addEventListener('click', function(event) {
+        const copyButton = event.target.closest('.copy-button');
+        if (copyButton && !copyButton.classList.contains('copied')) {
+            const codeBlock = copyButton.closest('.chatgpt-code-block');
+            const codeElement = codeBlock?.querySelector('code');
+            
+            if (codeElement) {
+                const codeText = codeElement.textContent;
+                
+                navigator.clipboard.writeText(codeText).then(() => {
+                    copyButton.textContent = 'Copied!';
+                    copyButton.classList.add('copied');
+                    
+                    setTimeout(() => {
+                        copyButton.textContent = 'Copy';
+                        copyButton.classList.remove('copied');
+                    }, 2000);
+                    
+                    console.log("✅ Code copied to clipboard");
+                }).catch(err => {
+                    console.error('❌ Failed to copy code:', err);
+                    copyButton.textContent = 'Failed';
+                    setTimeout(() => {
+                        copyButton.textContent = 'Copy';
+                    }, 2000);
+                });
+            }
+        }
+    });
+}
+    // ================= INITIALIZATION =================
+    function initialize() {
+    console.log("🔧 Initializing application...");
+    
+    // Add styles FIRST
+    addStyles();
+    
+    // Setup UI components
+    setupWindowControls();
+    setupTabs();
+    setupSteps();
+    setupEventListeners();
+    setupChatBox();
+     setupHotkeys(); // 🔥 ADD THIS LINE
+    setupCodeCopyButtons();
+    // Initialize status - Mic starts UNMUTED
+    micMuted = false;
+    systemMuted = false;
+    updateAudioStatus();
+        
+        // Show first step
+        document.querySelectorAll(".step").forEach(step => step.classList.remove("active"));
+        document.querySelector(".step-1")?.classList.add("active");
+        
+        // Initialize model select
+        const modelSelect = document.getElementById("modelSelect");
+        if (modelSelect) {
+            modelSelect.innerHTML = `
+                <option value="gpt-4o-mini" selected>GPT-4o Mini</option>
+                <option value="gpt-4o">GPT-4o</option>
+                <option value="gpt-4-turbo">GPT-4 Turbo</option>
+            `;
+        }
+        
+        // Load sessions if on history tab
+        const activeTab = document.querySelector('.tab.active');
+        if (activeTab && activeTab.getAttribute('data-tab') === 'history') {
+            loadSessions();
+        }
+        
+        console.log("✅ Application initialized successfully");
+    }
+    
+    // ================= START APPLICATION =================
+    initialize();
+    
+    // Auto-reconnect if SSE disconnects
+    setInterval(() => {
+        if (isSessionActive && (!sseConnection || sseConnection.readyState === EventSource.CLOSED)) {
+            console.log("🔄 SSE disconnected, reconnecting...");
+            connectSSE();
+        }
+    }, 5000);
+    
+    // Expose functions to global scope for HTML onclick handlers
+    window.loadSessionDetails = loadSessionDetails;
+    window.deleteSession = deleteSession;
+});
+
+// Global helper functions
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}:root {
+  --bg-card: #ffffff;
+  --bg-header: #f3f4f6;
+  --text-main: #111827;
+  --text-muted: #6b7280;
+  --border-subtle: #e5e7eb;
+  --primary-btn: #020617;
+  --primary-btn-hover: #111827;
+  --shadow-soft: 0 18px 40px rgba(15, 23, 42, 0.4);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  background: transparent; /* important for Electron overlay */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Root shell (Steps 1–3) */
+
+.window-shell {
+  width: 780px;
+  max-width: 100%;
+  border-radius: 24px;
+  background: var(--bg-card);
+  box-shadow: none;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  overflow: hidden;
+}
+
+.window-shell.overlay-mode {
+  background: transparent;
+  box-shadow: none;
+  border: none;
+}
+
+/* Header */
+
+.window-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg-header);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.45);
+}
+
+.drag-region {
+  -webkit-app-region: drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.title-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.app-title {
+  font-weight: 600;
+  font-size: 16px;
+}
+
+.subtitle {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.header-center {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.credit-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 13px;
+  border-radius: 999px;
+  background: #020617;
+  color: #e5e7eb;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.window-controls {
+  display: flex;
+  gap: 6px;
+}
+
+.ctrl {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.ctrl-min {
+  background: #e5e7eb;
+}
+
+.ctrl-min:hover {
+  background: #d1d5db;
+}
+
+.ctrl-close {
+  background: #fee2e2;
+  color: #ef4444;
+}
+
+.ctrl-close:hover {
+  background: #fecaca;
+}
+
+/* Tabs */
+
+.tab-bar {
+  display: flex;
+  padding: 8px 16px 0;
+  gap: 8px;
+}
+
+.tab {
+  border: none;
+  background: transparent;
+  padding: 6px 14px;
+  border-radius: 999px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+
+.tab.active {
+  background: #0f172a;
+  color: #f9fafb;
+}
+
+/* Content */
+
+.content {
+  padding: 12px 20px 16px;
+}
+
+.step {
+  display: none;
+}
+
+.step.active {
+  display: block;
+}
+
+/* Step themes */
+
+.step-light {
+  background: #ffffff;
+  border-radius: 16px;
+  padding: 12px 12px 4px;
+}
+
+.step-dark {
+  background: transparent;
+  color: #e5e7eb;
+}
+
+/* Tab panels */
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
+/* Titles */
+
+.section-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 6px 0 2px;
+}
+
+.helper-text {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+}
+
+/* Session card */
+
+.session-type-card {
+  border-radius: 14px;
+  border: 1px solid var(--border-subtle);
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  background: #f9fafb;
+}
+
+/* Buttons */
+
+.primary-btn,
+.secondary-btn,
+.ghost-btn {
+  border-radius: 999px;
+  padding: 8px 18px;
+  font-size: 13px;
+  border: none;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.primary-btn {
+  background: var(--primary-btn);
+  color: #ffffff;
+}
+
+.primary-btn:hover {
+  background: var(--primary-btn-hover);
+}
+
+.secondary-btn {
+  background: #f3f4f6;
+  color: #111827;
+}
+
+.secondary-btn:hover {
+  background: #e5e7eb;
+}
+
+.small {
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.ghost-btn {
+  background: #f3f4f6;
+  color: #111827;
+}
+
+.footer-buttons {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 16px;
+}
+
+/* Inputs */
+
+.form-group {
+  margin-bottom: 12px;
+}
+
+.field-label {
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.required {
+  color: #ef4444;
+}
+
+.text-input {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+}
+
+.text-input:focus {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 1px rgba(79, 70, 229, 0.4);
+}
+
+.text-area {
+  resize: vertical;
+  min-height: 70px;
+}
+
+.form-group.inline {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 0.8fr);
+  gap: 12px;
+}
+
+/* Resume */
+
+.resume-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-radius: 10px;
+  border: 1px dashed var(--border-subtle);
+  padding: 8px 10px;
+}
+
+.resume-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Provider pills (Step 3) */
+
+.model-row {
+  display: flex;
+  gap: 8px;
+}
+
+.pill {
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  border: 1px solid var(--border-subtle);
+  background: #f9fafb;
+  cursor: pointer;
+}
+
+.pill-primary {
+  background: #020617;
+  color: #e5e7eb;
+  border-color: #020617;
+}
+
+/* ===================================================== */
+/* STEP-4 OVERLAY – ONLY TOOLBAR + Q/A PANEL ARE VISIBLE */
+/* ===================================================== */
+
+body.step4-active .content,
+body.step4-active .tab-bar {
+  display: none;
+}
+
+body.step4-active .window-shell {
+  background: transparent;
+  box-shadow: none;
+  border: none;
+  display: none; /* completely hide shell, only overlay visible */
+}
+
+/* ---------- Top glass toolbar ---------- */
+
+.ai-overlay-bar {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+
+  width: 760px;
+  max-width: 96vw;
+
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+
+  padding: 6px 10px;
+  border-radius: 999px;
+
+  background: rgba(15, 23, 42, 0.35); /* lighter glass */
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+
+  border: 1px solid rgba(148, 163, 184, 0.6);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.9);
+  color: #f9fafb;
+}
+
+body.step4-active .ai-overlay-bar {
+  display: flex;
+}
+
+.ai-overlay-left,
+.ai-overlay-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* mic/system icons */
+
+.circle-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.6);
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(15, 23, 42, 0.95);
+  color: #f9fafb;
+}
+
+.circle-icon.is-off {
+  opacity: 0.35;
+}
+
+.circle-icon.is-on {
+  opacity: 1;
+}
+
+/* square toolbar buttons */
+
+.square-icon {
+  min-width: 26px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.6);
+  cursor: pointer;
+  background: rgba(15, 23, 42, 0.95);
+  color: #f9fafb;
+  font-size: 12px;
+}
+
+/* toolbar pills override */
+
+.ai-overlay-bar .pill {
+  border-radius: 999px;
+  padding: 4px 14px;
+  font-size: 13px;
+  border: 1px solid rgba(148, 163, 184, 0.7);
+  background: transparent;
+  color: #f9fafb;
+  white-space: nowrap;
+}
+
+.ai-overlay-bar .pill.filled {
+  background: #f9fafb;
+  color: #020617;
+  border-color: #f9fafb;
+}
+
+/* ---------- Glass Q/A panel ---------- */
+
+.ai-panel {
+  position: fixed;
+  top: 56px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 760px;
+  max-width: 96vw;
+
+  padding: 14px 16px 16px;
+  border-radius: 22px;
+
+  background: rgba(8, 12, 19, 0.38); /* lighter */
+ 
+
+  border: 1px solid rgba(148, 163, 184, 0.65);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.95);
+
+  color: #f9fafb;
+  z-index: 999;
+  display: none;
+
+  resize: both;          /* allow resizing */
+  overflow: auto;
+}
+
+body.step4-active .ai-panel[data-open="true"] {
+  display: block;
+}
+
+body.step4-active .ai-panel {
+  display: none; /* Hidden by default when in step4 */
+}
+
+.ai-panel-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.ai-panel-title {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+/* Q&A card */
+
+.qa-card {
+  margin-top: 6px;
+  border-radius: 16px;
+  padding: 14px 16px 10px;
+  background: radial-gradient(circle at 0% 0%, #1f2937 0, #020617 55%);
+  color: #f9fafb;
+  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.5);
+
+  min-height: 220px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.qa-label-question,
+.qa-label-answer {
+  font-weight: 600;
+  color: #fde68a;
+  margin-right: 4px;
+}
+
+.qa-question-row,
+.qa-answer-row {
+  margin-bottom: 8px;
+}
+
+.qa-question-text {
+  margin: 4px 0 6px;
+}
+/* =====================================================
+   STEP 4 – REMOVE BACKSIDE SHADOW ONLY
+   (Toolbar + Q/A Panel)
+   ===================================================== */
+
+/* Top toolbar – remove backside shadow */
+body.step4-active .ai-overlay-bar {
+  box-shadow: none !important;      /* 🔥 removes dark glow */
+}
+
+/* Q/A panel – remove backside shadow */
+body.step4-active .ai-panel {
+  box-shadow: none !important;      /* 🔥 removes dark glow */
+}
+
+/* Inner Q/A card – remove shadow only */
+body.step4-active .qa-card {
+  box-shadow: none !important;      /* 🔥 removes depth shadow */
+}
+
+/* Answers */
+
+.qa-answer {
+  font-size: 14px;
+  color: #f9fafb;
+}
+
+.qa-answer ul {
+  margin: 4px 0 6px 18px;
+  padding: 0;
+}
+
+.qa-answer li {
+  margin-bottom: 4px;
+}
+
+/* Code blocks inside Q/A */
+
+.qa-code {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid rgba(148, 163, 184, 0.7);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.qa-footer {
+  margin-top: 12px;
+  font-size: 12px;
+  color: #e5e7eb;
+}
+
+/* controls + duration */
+
+.control-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+  align-items: center;
+}
+
+.aihelp-clock {
+  font-size: 12px;
+  color: #e5e7eb;
+  opacity: 0.8;
+}
+
+/* Chat row */
+
+.chat-row {
+  margin-top: 10px;
+  display: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-input {
+  flex: 1;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.7);
+  padding: 8px 12px;
+  font-size: 13px;
+  background: rgba(15, 23, 42, 0.95);
+  color: #f9fafb;
+}
+
+.chat-input::placeholder {
+  color: #9ca3af;
+}
+
+/* History layout */
+
+.history-layout {
+  display: grid;
+  grid-template-columns: 230px minmax(0, 1fr);
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.session-list {
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  padding: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+  background: #f9fafb;
+  font-size: 13px;
+}
+
+.session-item {
+  border-radius: 10px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  cursor: pointer;
+}
+
+.session-item:hover {
+  background: #e5e7eb;
+}
+
+.session-item.active {
+  background: #0f172a;
+  color: #f9fafb;
+}
+
+.session-detail {
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  padding: 10px;
+  background: #f9fafb;
+}
+
+.session-meta {
+  font-size: 12px;
+  color: #4b5563;
+  margin-bottom: 8px;
+}
+
+.message-list {
+  max-height: 260px;
+  overflow-y: auto;
+  font-size: 13px;
+  color: #111827;
+}
+
+.msg-row {
+  margin-bottom: 8px;
+}
+
+.msg-role.user {
+  font-weight: 600;
+  color: #16a34a;
+}
+
+.msg-role.assistant {
+  font-weight: 600;
+  color: #2563eb;
+}
+body.step4-active .content,
+body.step4-active .tab-bar {
+  display: none;
+}
+
+body.step4-active .window-shell {
+  display: none;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+.chat-row {
+  display: none;
+}
+/* Collapse Q/A panel */
+.ai-panel.collapsed {
+  height: 42px;
+  overflow: hidden;
+}
+
+.ai-panel.collapsed .qa-card,
+.ai-panel.collapsed .chat-row,
+.ai-panel.collapsed .control-row {
+  display: none;
+}
+/* 🔥 Fully disable setup UI when overlay is active */
+body.step4-active .window-shell {
+  display: none !important;
+  pointer-events: none !important;
+}
+
+
+/* Add these to your existing styles.css */
+
+/* Thinking animation */
+.thinking {
+  color: #94a3b8;
+  font-style: italic;
+  padding: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  animation: pulse 1.5s infinite;
+}
+
+.thinking:before {
+  content: "";
+  width: 16px;
+  height: 16px;
+  border: 2px solid #3b82f6;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+/* Error message */
+.error {
+  color: #f87171;
+  padding: 12px;
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: 8px;
+  border-left: 3px solid #f87171;
+  margin: 8px 0;
+}
+
+
+
+/* Ensure text appears properly */
+.qa-question-text {
+  min-height: 24px;
+  padding: 8px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #f9fafb;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.qa-answer {
+  min-height: 60px;
+  max-height: 400px;
+  overflow-y: auto;
+  padding-right: 8px;
+}
+
+/* Scrollbar Styling */
+.qa-answer::-webkit-scrollbar {
+  width: 8px;
+}
+
+.qa-answer::-webkit-scrollbar-track {
+  background: rgba(30, 41, 59, 0.3);
+  border-radius: 4px;
+}
+
+.qa-answer::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 4px;
+}
+
+.qa-answer::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Ensure speech text appears with animation */
+#qaQuestion {
+  animation: fadeIn 0.3s ease;
+  transition: all 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0.7; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Chat row improvements */
+.chat-row {
+  margin-top: 16px;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  background: rgba(15, 23, 42, 0.7);
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+}
+
+.chat-input {
+  flex: 1;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.7);
+  padding: 10px 16px;
+  font-size: 13px;
+  background: rgba(15, 23, 42, 0.95);
+  color: #f9fafb;
+  outline: none;
+  transition: all 0.2s;
+}
+
+.chat-input:focus {
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
+}
+
+.chat-input::placeholder {
+  color: #94a3b8;
+}
+
+/* Q&A footer improvements */
+.qa-footer {
+  margin-top: 16px;
+  font-size: 12px;
+  color: #e5e7eb;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+/* Audio toggle states */
+.circle-icon.is-on {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: #3b82f6;
+  color: #3b82f6;
+}
+
+.circle-icon.is-off {
+  background: rgba(148, 163, 184, 0.1);
+  border-color: rgba(148, 163, 184, 0.4);
+  color: rgba(148, 163, 184, 0.6);
+}
+
+/* Smooth transitions for all interactive elements */
+button, input, textarea, select {
+  transition: all 0.2s ease;
+}
+
+/* Responsive adjustments for overlay */
+@media (max-width: 800px) {
+  .ai-overlay-bar,
+  .ai-panel {
+    width: 95vw;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+  
+  .ai-panel {
+    top: 60px;
+  }
+}
+/* Bullet per sentence formatting */
+.bullet-list {
+    list-style: none;
+    padding-left: 0;
+    margin: 0;
+}
+.bullet-item {
+    position: relative;
+    padding-left: 20px;
+    margin-bottom: 12px;
+    line-height: 1.5;
+}
+.bullet-item::before {
+    content: "•";
+    position: absolute;
+    left: 0;
+    color: #fde68a; /* Yellow bullets as per your label theme */
+    font-weight: bold;
+}
+
+/* ChatGPT style code box */
+.code-block-container {
+    background: #0f172a;
+    border: 1px solid rgba(148, 163, 184, 0.4);
+    border-radius: 8px;
+    margin: 15px 0;
+    overflow: hidden;
+}
+.code-header {
+    background: #1e293b;
+    padding: 5px 12px;
+    font-size: 11px;
+    text-transform: uppercase;
+    color: #94a3b8;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}
+.code-block {
+    padding: 12px;
+    margin: 0;
+    overflow-x: auto;
+    font-family: monospace;
+    font-size: 13px;
+    color: #e2e8f0;
+}
+/* Enhanced bullet points */
+    .bullet-list {
+      margin: 16px 0;
+      padding-left: 0;
+    }
+    
+    .bullet-item {
+      position: relative;
+      padding-left: 24px;
+      margin-bottom: 12px;
+      line-height: 1.6;
+      color: #f9fafb;
+      font-size: 14px;
+    }
+    
+    .bullet-item:before {
+      content: "•";
+      position: absolute;
+      left: 8px;
+      color: #fde68a;
+      font-size: 18px;
+      font-weight: bold;
+    }
+    
+    /* Code blocks */
+    .code-block-container {
+      background: #0f172a;
+      border-radius: 8px;
+      margin: 16px 0;
+      border: 1px solid #334155;
+      overflow: hidden;
+    }
+    
+    .code-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 12px;
+      background: #1e293b;
+      border-bottom: 1px solid #334155;
+    }
+    
+    .code-language {
+      font-family: 'SF Mono', Monaco, monospace;
+      font-size: 12px;
+      color: #94a3b8;
+      font-weight: 500;
+      text-transform: uppercase;
+    }
+    
+    .copy-code-btn {
+      background: #3b82f6;
+      color: white;
+      border: none;
+      padding: 4px 12px;
+      border-radius: 4px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    
+    .copy-code-btn:hover {
+      background: #2563eb;
+    }
+    
+    .code-block {
+      padding: 16px;
+      margin: 0;
+      overflow-x: auto;
+      font-family: 'SF Mono', Monaco, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      color: #e2e8f0;
+      background: #0f172a;
+    }
+    
+    .inline-code {
+      background: rgba(30, 41, 59, 0.7);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'SF Mono', Monaco, monospace;
+      font-size: 13px;
+      color: #fbbf24;
+      border: 1px solid #475569;
+    }
+    
+    /* Thinking animation */
+    .thinking {
+      color: #94a3b8;
+      font-style: italic;
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      animation: pulse 1.5s infinite;
+    }
+    
+    .thinking:before {
+      content: "";
+      width: 16px;
+      height: 16px;
+      border: 2px solid #3b82f6;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+    
+    /* Error styling */
+    .error {
+      color: #f87171;
+      padding: 16px;
+      background: rgba(239, 68, 68, 0.1);
+      border-radius: 8px;
+      border-left: 3px solid #f87171;
+      margin: 12px 0;
+      line-height: 1.5;
+    }
+    
+    /* AI complete marker */
+    .ai-complete {
+      color: #10b981;
+      padding: 8px 0;
+      font-size: 12px;
+      border-top: 1px solid rgba(148, 163, 184, 0.3);
+      margin-top: 12px;
+    }
+    
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 0.6; }
+      50% { opacity: 1; }
+    }
+    
+    /* Smooth transitions */
+    .qa-question-text {
+      min-height: 24px;
+      padding: 8px 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #f9fafb;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    
+    /* Audio status indicators */
+    .circle-icon.is-on {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: #3b82f6;
+      color: #3b82f6;
+    }
+    
+    .circle-icon.is-off {
+      background: rgba(148, 163, 184, 0.1);
+      border-color: rgba(148, 163, 184, 0.4);
+      color: rgba(148, 163, 184, 0.6);
+    }
+    
+    /* Ensure proper overflow */
+    .qa-answer {
+      max-height: 60vh;
+      overflow-y: auto;
+    }
+    
+    .qa-answer::-webkit-scrollbar {
+      width: 8px;
+    }
+    
+    .qa-answer::-webkit-scrollbar-track {
+      background: rgba(30, 41, 59, 0.3);
+      border-radius: 4px;
+    }
+    
+    .qa-answer::-webkit-scrollbar-thumb {
+      background: #475569;
+      border-radius: 4px;
+    }
+    
+    .qa-answer::-webkit-scrollbar-thumb:hover {
+      background: #64748b;
+    }
+    
+    /* Chat row */
+    .chat-row {
+      display: none;
+      margin-top: 12px;
+      gap: 8px;
+      align-items: center;
+    }
+    
+    .chat-input {
+      flex: 1;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.7);
+      padding: 8px 12px;
+      font-size: 13px;
+      background: rgba(15, 23, 42, 0.95);
+      color: #f9fafb;
+      outline: none;
+    }
+
+    
+
+
+
+
+
+
+
+
+
+    /* ================= NAVIGATION TOOLBAR ================= */
+.navigation-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 10px 0;
+    padding: 8px 12px;
+    background: rgba(15, 23, 42, 0.7);
+    border-radius: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.4);
+}
+
+.nav-btn {
+    background: rgba(59, 130, 246, 0.2);
+    border: 1px solid rgba(59, 130, 246, 0.5);
+    color: #3b82f6;
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.2s;
+}
+
+.nav-btn:hover:not(:disabled) {
+    background: rgba(59, 130, 246, 0.3);
+    border-color: #3b82f6;
+}
+
+.nav-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+#qaCounter {
+    font-size: 12px;
+    color: #94a3b8;
+    min-width: 40px;
+    text-align: center;
+}
+
+.context-filter {
+    background: rgba(15, 23, 42, 0.9);
+    border: 1px solid rgba(148, 163, 184, 0.5);
+    color: #f9fafb;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    margin-left: auto;
+}
+
+/* ================= HISTORY MODAL ================= */
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 10000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.7);
+}
+
+.modal-content {
+    background: #0f172a;
+    border-radius: 16px;
+    width: 90%;
+    max-width: 1000px;
+    height: 80%;
+    margin: 5% auto;
+    border: 1px solid #334155;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8);
+    display: flex;
+    flex-direction: column;
+}
+
+.modal-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid #334155;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.modal-header h3 {
+    margin: 0;
+    color: #f9fafb;
+}
+
+.close-modal {
+    background: none;
+    border: none;
+    color: #94a3b8;
+    font-size: 24px;
+    cursor: pointer;
+    padding: 0;
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.modal-body {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 20px;
+    padding: 20px;
+    overflow: hidden;
+}
+
+.sessions-list {
+    overflow-y: auto;
+    border-right: 1px solid #334155;
+    padding-right: 15px;
+}
+
+.qa-history {
+    overflow-y: auto;
+}
+
+.session-item {
+    padding: 10px;
+    margin-bottom: 8px;
+    background: rgba(30, 41, 59, 0.5);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.session-item:hover {
+    background: rgba(30, 41, 59, 0.8);
+    border-color: #3b82f6;
+}
+
+.session-item.active {
+    background: rgba(59, 130, 246, 0.2);
+    border: 1px solid #3b82f6;
+}
+
+.session-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 5px;
+}
+
+.session-info {
+    font-size: 11px;
+    color: #94a3b8;
+    display: flex;
+    justify-content: space-between;
+}
+
+.qa-history-item {
+    padding: 12px;
+    margin-bottom: 10px;
+    background: rgba(30, 41, 59, 0.5);
+    border-radius: 8px;
+    border-left: 3px solid #3b82f6;
+}
+
+.qa-question {
+    color: #f9fafb;
+    margin-bottom: 8px;
+    font-weight: 500;
+}
+
+.qa-answer {
+    color: #cbd5e1;
+    font-size: 13px;
+    margin-bottom: 6px;
+}
+
+.qa-meta {
+    font-size: 11px;
+    color: #94a3b8;
+    display: flex;
+    justify-content: space-between;
+}
+
+/* ================= CONTEXT INDICATORS ================= */
+.context-indicator {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+}
+
+.context-company {
+    background: #10b981;
+}
+
+.context-job {
+    background: #3b82f6;
+}
+
+.context-resume {
+    background: #f59e0b;
+}
+
+.context-instructions {
+    background: #8b5cf6;
+}
+
+/* ================= TOOLTIP ================= */
+.tooltip {
+    position: relative;
+    display: inline-block;
+}
+
+.tooltip .tooltiptext {
+    visibility: hidden;
+    width: 200px;
+    background-color: #0f172a;
+    color: #f9fafb;
+    text-align: center;
+    border-radius: 6px;
+    padding: 8px;
+    position: absolute;
+    z-index: 1;
+    bottom: 125%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 1px solid #334155;
+    font-size: 12px;
+    opacity: 0;
+    transition: opacity 0.3s;
+}
+
+.tooltip:hover .tooltiptext {
+    visibility: visible;
+    opacity: 1;
+}
+
+
+/* ================= CHATGPT-STYLE CODE BLOCKS ================= */
+.chatgpt-code-block {
+    background: #0f172a;
+    border-radius: 8px;
+    margin: 16px 0;
+    border: 1px solid #334155;
+    overflow: hidden;
+    font-family: 'SF Mono', Monaco, 'Cascadia Mono', 'Segoe UI Mono', monospace;
+}
+
+.chatgpt-code-block .code-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    background: #1e293b;
+    border-bottom: 1px solid #334155;
+    font-size: 12px;
+}
+
+.chatgpt-code-block .code-language {
+    color: #94a3b8;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.chatgpt-code-block .copy-button {
+    background: #3b82f6;
+    color: white;
+    border: none;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+.chatgpt-code-block .copy-button:hover {
+    background: #2563eb;
+    transform: translateY(-1px);
+}
+
+.chatgpt-code-block .copy-button:active {
+    transform: translateY(0);
+}
+
+.chatgpt-code-block .copy-button.copied {
+    background: #10b981;
+}
+
+.chatgpt-code-block pre {
+    margin: 0;
+    padding: 0;
+    overflow-x: auto;
+}
+
+.chatgpt-code-block code {
+    display: block;
+    padding: 16px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #e2e8f0;
+    white-space: pre;
+    tab-size: 4;
+}
+
+/* Syntax highlighting colors */
+.chatgpt-code-block .language-python code {
+    color: #7dd3fc;
+}
+
+.chatgpt-code-block .language-javascript code,
+.chatgpt-code-block .language-js code {
+    color: #fbbf24;
+}
+
+.chatgpt-code-block .language-html code {
+    color: #f87171;
+}
+
+.chatgpt-code-block .language-css code {
+    color: #60a5fa;
+}
+
+.chatgpt-code-block .language-java code {
+    color: #34d399;
+}
+
+.chatgpt-code-block .language-cpp code,
+.chatgpt-code-block .language-c code {
+    color: #c084fc;
+}
+
+.chatgpt-code-block .language-sql code {
+    color: #c084fc;
+}
+
+.chatgpt-code-block .language-json code {
+    color: #2dd4bf;
+}
+
+.chatgpt-code-block .language-bash code,
+.chatgpt-code-block .language-shell code {
+    color: #86efac;
+}
+
+/* Inline code styling */
+.inline-code {
+    background: rgba(30, 41, 59, 0.7);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'SF Mono', Monaco, monospace;
+    font-size: 13px;
+    color: #fbbf24;
+    border: 1px solid #475569;
+}
+
+/* Code line numbers */
+.code-line-numbers {
+    display: inline-block;
+    padding-right: 12px;
+    margin-right: 12px;
+    border-right: 1px solid #334155;
+    color: #64748b;
+    text-align: right;
+    user-select: none;
+}

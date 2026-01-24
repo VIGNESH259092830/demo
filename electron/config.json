@@ -1,0 +1,11 @@
+{
+    "installed": true,
+    "firstRun": false,
+    "installDate": "",
+    "settings": {
+        "autoStart": true,
+        "minimizeToTray": true,
+        "showWelcome": false,
+        "theme": "dark"
+    }
+}
