@@ -1,3 +1,18 @@
+i give full program i want exe built in local machine run completed 
+don t touch the give program
+
+ when i open  the application  backend automatically start with all working program includeing  db also
+ main this  application of  exe  copy and paste another laptop  it also works   in the laptop
+
+ in give below i give project structure of file and program i want running condition ofbackend  and front end  both
+
+ give full explanation and tell the work flow
+
+ find the version of program 
+ python --version 
+Python 3.10.11
+Node.js v24.20.4
+(venv) PS C:\Users\RITHISH\Desktop\completed> 
 from openai import AzureOpenAI
 import threading
 import os
@@ -48,7 +63,9 @@ def ask_ai_sync(text):
         )
         return resp.choices[0].message.content
     except Exception as e:
-        return f"Error: {str(e)}"def build_interview_prompt(session_data: dict, current_question: str, history: list = None) -> str:
+        return f"Error: {str(e)}"
+
+def build_interview_prompt(session_data: dict, current_question: str, history: list = None) -> str:
     """Build interview-aware prompt using session data and history"""
     
     # Extract session data
@@ -108,7 +125,8 @@ Please provide a well-structured interview answer that:
 ANSWER:
 """
     
-    return promptimport azure.cognitiveservices.speech as speechsdk
+    return prompt
+import azure.cognitiveservices.speech as speechsdk
 from app.shared.state import state
 import time
 import threading
@@ -386,7 +404,9 @@ def get_mic_status():
         "partial_buffer": _partial_buffer,
         "pending_partials_count": len(_pending_partials),
         "sentence_history_count": len(_sentence_history)
-    }# app/audio/system_stt.py - COMPLETE WORKING VERSION WITH DUPLICATE PREVENTION
+    }
+
+# app/audio/system_stt.py - COMPLETE WORKING VERSION WITH DUPLICATE PREVENTION
 import soundcard as sc
 import numpy as np
 import azure.cognitiveservices.speech as speechsdk
@@ -1015,7 +1035,8 @@ if __name__ == "__main__":
     print("- get_system_status()")
     print("- force_refresh()")
     print("- send_keepalive()")
-    print("- test_system_audio()")import mysql.connector
+    print("- test_system_audio()")
+import mysql.connector
 import os
 from dotenv import load_dotenv
 
@@ -1069,7 +1090,9 @@ def init_db():
         
     except mysql.connector.Error as err:
         print(f"❌ Database initialization error: {err}")
-        raise err# app/db/json_encoder.py
+        raise err
+
+# app/db/json_encoder.py
 import json
 from datetime import datetime, date, time
 from decimal import Decimal
@@ -1098,7 +1121,9 @@ def json_serializable(data):
     elif hasattr(data, 'strftime'):
         return data.strftime('%Y-%m-%d %H:%M:%S')
     else:
-        return data# app/db/qa_repo.py
+        return data
+
+# app/db/qa_repo.py
 from .connection import get_db
 from datetime import datetime
 
@@ -1151,7 +1176,9 @@ def get_recent_history(session_id, limit=6):
         return rows[::-1]
     finally:
         cur.close()
-        db.close()# reset_db.py
+        db.close()
+
+# reset_db.py
 import mysql.connector
 from dotenv import load_dotenv
 import os
@@ -1215,7 +1242,9 @@ def reset_database():
         raise err
 
 if __name__ == "__main__":
-    reset_database()from dataclasses import dataclass
+    reset_database()
+
+from dataclasses import dataclass
 from datetime import datetime
 
 @dataclass
@@ -1233,7 +1262,9 @@ class QAMessage:
     session_id: int
     role: str  # 'question' or 'answer'
     content: str
-    created_at: datetime# app/db/session_repo.py
+    created_at: datetime
+
+# app/db/session_repo.py
 from .connection import get_db
 from datetime import datetime
 
@@ -1329,7 +1360,9 @@ def delete_session(session_id):
         raise e
     finally:
         cur.close()
-        db.close()# setup_db.py
+        db.close()
+
+# setup_db.py
 import mysql.connector
 from dotenv import load_dotenv
 import os
@@ -1394,7 +1427,27 @@ def setup_database():
         raise err
 
 if __name__ == "__main__":
-    setup_database()import os
+    setup_database()
+import sys
+import os
+import socket
+
+socket.setdefaulttimeout(10)
+
+# ================= PATH FIX (MUST BE FIRST) =================
+if getattr(sys, "frozen", False):
+    BASE_DIR = sys._MEIPASS
+    PROJECT_ROOT = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    PROJECT_ROOT = os.path.dirname(BASE_DIR)
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+# ===========================================================
+
+
+
 import threading
 import time
 import json
@@ -1767,103 +1820,104 @@ def format_ai_response_bullets(response_text):
     
     return result
 
-# ================= AI ANSWER ENDPOINT =================
- # Make sure this is imported at the top of your file
 
-@app.post("/api/answer-stream")
-async def answer_with_context_stream(request: Request):
-    """Handle AI answer generation with streaming"""
+
+    
+    
+@app.post("/api/answer-stream-fast")
+async def answer_with_context_stream_fast(request: Request):
+    """
+    ULTRA-FAST AI streaming
+    - First token < 2 sec
+    - Raw token streaming
+    - Final formatting only once
+    """
     try:
         body = await request.json()
         question = body.get("text", "").strip()
-        
+
         if not question:
-            return JSONResponse({"error": "Empty question", "success": False})
-        
-        print(f"🤖 AI Question: '{question}'")
-        
-        # 🔥 RULE 3: Prepare for AI response
+            return JSONResponse({"success": False, "error": "Empty question"})
+
+        print(f"🚀 ULTRA-FAST AI Question: '{question}'")
+
+        # 🔥 Reset AI state (UNCHANGED)
         state.reset_for_answer_button(question)
-        
+
         async def generate():
             try:
-                # Get history if session exists
-                history = []
-                if current_session_id:
-                    history = get_recent_history(current_session_id, limit=5)
-                    print(f"📖 Loaded {len(history)} previous messages")
-                
-                # 🔥 RULE 8: Build interview-specific prompt
-                prompt = build_interview_prompt(session_data, question, history)
-                print(f"📝 Prompt built ({len(prompt)} chars)")
-                
-                # Save question to database
-                if current_session_id:
-                    save_message(current_session_id, "question", question)
-                
-                # Send start signal
-                yield f"data: {json.dumps({'type': 'ai_start', 'message': 'AI is generating answer...'})}\n\n"
-                
-                # Get AI response with streaming
+                # 🔥 MINIMAL PROMPT = FAST FIRST TOKEN
+                prompt = f"Answer this interview question clearly and concisely:\n\n{question}"
+
+                # 🔥 Notify frontend immediately
+                yield f"data: {json.dumps({'type': 'ai_start'})}\n\n"
+
+                start_time = time.time()
+                first_token_sent = False
+                full_response = ""
+
+                # 🔥 STREAM ENABLED CALL (FAST PATH)
                 stream = client.chat.completions.create(
                     model=DEPLOYMENT,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.3,
-                    max_tokens=1000,
+                    temperature=0.2,
+                    max_tokens=800,     # lower = faster
                     stream=True
                 )
-                
-                full_response = ""
-                chunk_buffer = ""
-                
+
+                # 🔥 STREAM RAW TOKENS IMMEDIATELY
                 for chunk in stream:
-                    if chunk.choices and len(chunk.choices) > 0:
-                        delta = chunk.choices[0].delta
-                        if hasattr(delta, 'content') and delta.content:
-                            content = delta.content
-                            full_response += content
-                            chunk_buffer += content
-                            
-                            # 🔥 Send formatted chunks when buffer is large enough
-                            if len(chunk_buffer) >= 80:  # Send chunks of about 80 chars
-                                # Format this chunk for display
-                                formatted_chunk = format_ai_response_bullets(chunk_buffer)
-                                if formatted_chunk:
-                                    yield f"data: {json.dumps({'type': 'ai_chunk', 'content': formatted_chunk})}\n\n"
-                                chunk_buffer = ""
-                
-                # Send any remaining chunk (formatted)
-                if chunk_buffer:
-                    formatted_chunk = format_ai_response_bullets(chunk_buffer)
-                    if formatted_chunk:
-                        yield f"data: {json.dumps({'type': 'ai_chunk', 'content': formatted_chunk})}\n\n"
-                
-                print(f"✅ AI response complete: {len(full_response)} chars")
-                
-                # Save complete response (plain text)
+                    if not chunk.choices:
+                        continue
+
+                    delta = chunk.choices[0].delta
+                    if not delta or not delta.content:
+                        continue
+
+                    token = delta.content
+                    full_response += token
+
+                    if not first_token_sent:
+                        print(f"⚡ FIRST TOKEN in {time.time() - start_time:.2f}s")
+                        first_token_sent = True
+
+                    # 🔥 SEND RAW TOKEN (NO FORMATTING)
+                    yield f"data: {json.dumps({'type': 'ai_stream', 'content': token})}\n\n"
+
+                print(f"✅ AI completed in {time.time() - start_time:.2f}s")
+
+                # 🔥 SAVE FULL ANSWER (NON-BLOCKING)
                 if current_session_id:
                     save_message(current_session_id, "answer", full_response)
-                
-                # Send final complete formatted response
-                final_formatted = format_ai_response_bullets(full_response)
-                yield f"data: {json.dumps({'type': 'ai_complete', 'content': final_formatted})}\n\n"
-                
-                # 🔥 RULE 3: Mark AI response complete and prepare for next question
+
+                # 🔥 FINAL FORMATTING (ONCE)
+                final_html = format_ai_response_bullets(full_response)
+                yield f"data: {json.dumps({'type': 'ai_complete', 'content': final_html})}\n\n"
+
                 state.complete_ai_response(full_response)
-                
+
             except Exception as e:
-                error_msg = str(e)
-                print(f"❌ AI Streaming Error: {error_msg}")
-                
-                # Send error and reset state
+                print("❌ AI STREAM ERROR:", e)
                 state.is_ai_responding = False
-                yield f"data: {json.dumps({'type': 'ai_error', 'error': error_msg})}\n\n"
-        
-        return StreamingResponse(generate(), media_type="text/event-stream")
-        
+                yield f"data: {json.dumps({'type': 'ai_error', 'error': str(e)})}\n\n"
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+                "Content-Encoding": "none"
+            }
+        )
+
     except Exception as e:
-        print(f"❌ POST request error: {e}")
-        return JSONResponse({"error": str(e), "success": False})
+        print("❌ POST ERROR:", e)
+        return JSONResponse({"success": False, "error": str(e)})
+
+
+
 # ================= CLEAR BUTTON ENDPOINT =================
 @app.post("/api/clear-and-reset")
 async def clear_and_reset(request: Request):
@@ -2035,18 +2089,234 @@ def health_check():
 # ================= STARTUP =================
 @app.on_event("startup")
 def startup():
-    """Startup event"""
-    def delayed_start():
-        time.sleep(2.0)
-        start_audio_services()
-    
-    threading.Thread(target=delayed_start, daemon=True).start()
-    print("🚀 Server started - Audio services starting in 2 seconds...")
+    try:
+        print("🔥 Warming Azure OpenAI STREAMING...")
+        stream = client.chat.completions.create(
+            model=DEPLOYMENT,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+            stream=True
+        )
+        for _ in stream:
+            break
+        print("✅ Azure OpenAI streaming warmed")
+    except Exception as e:
+        print("⚠️ Azure warm-up failed:", e)
+
+    threading.Thread(
+        target=start_audio_services,
+        daemon=True
+    ).start()
+
 
 # ================= MAIN =================
 if __name__ == "__main__":
+    import multiprocessing
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000, reload=True)<!DOCTYPE html>
+
+    multiprocessing.freeze_support()
+
+    config = uvicorn.Config(
+        app=app,                 # 🔥 PASS APP OBJECT, NOT STRING
+        host="127.0.0.1",
+        port=8000,
+        log_level="info",
+        loop="asyncio",
+        lifespan="on"
+    )
+
+    server = uvicorn.Server(config)
+    server.run()
+
+
+# -*- mode: python ; coding: utf-8 -*-
+
+from PyInstaller.utils.hooks import collect_dynamic_libs
+
+azure_bins = collect_dynamic_libs("azure.cognitiveservices.speech")
+
+a = Analysis(
+    ["main.py"],
+    pathex=["."],
+    binaries=azure_bins,
+    hiddenimports=[
+        "azure.cognitiveservices.speech",
+        "azure.cognitiveservices.speech.audio",
+        "soundcard",
+        "numpy",
+        "mysql.connector",
+        "mysql.connector.plugins.mysql_native_password",
+        "dotenv",
+        "openai",
+        "fastapi",
+        "fastapi.middleware.cors",
+        "fastapi.responses",
+        "uvicorn",
+        "uvicorn.logging",
+        "uvicorn.protocols.http.h11_impl",
+        "uvicorn.protocols.websockets.websockets_impl",
+    ],
+)
+
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    name="backend",
+    console=True,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    name="backend",
+)
+# -*- mode: python ; coding: utf-8 -*-
+
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
+    binaries=[('C:\\Users\\RITHISH\\Desktop\\completed\\venv\\lib\\site-packages\\azure\\cognitiveservices\\speech\\*.dll', 'azure/cognitiveservices/speech')],
+    datas=[],
+    hiddenimports=['azure.cognitiveservices.speech', 'soundcard', 'numpy', 'mysql.connector'],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='backend_debug',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    runtime_tmpdir=None,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Circle</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            background: transparent;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        .circle {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 24px;
+            user-select: none;
+            border: 2px solid rgba(255,255,255,0.2);
+            transition: transform 0.2s;
+        }
+        
+        .circle:hover {
+            transform: scale(1.1);
+        }
+        
+        .circle:active {
+            transform: scale(0.95);
+        }
+    </style>
+</head>
+<body>
+    <div class="circle" id="circleBtn">
+        AI
+    </div>
+    
+    <script>
+        const circleBtn = document.getElementById('circleBtn');
+        
+        // Click to restore
+        circleBtn.addEventListener('click', () => {
+            window.electronAPI.restoreWindow();
+        });
+        
+        // Make draggable
+        let isDragging = false;
+        let offsetX, offsetY;
+        
+        circleBtn.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            offsetX = e.clientX;
+            offsetY = e.clientY;
+            e.preventDefault();
+        });
+        
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            
+            const x = e.screenX - offsetX;
+            const y = e.screenY - offsetY;
+            
+            window.electronAPI.moveCircle(x, y);
+        });
+        
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+        
+        // Double click
+        circleBtn.addEventListener('dblclick', () => {
+            window.electronAPI.restoreWindow();
+        });
+    </script>
+</body>
+</html>{
+    "installed": true,
+    "firstRun": false,
+    "installDate": "",
+    "settings": {
+        "autoStart": true,
+        "minimizeToTray": true,
+        "showWelcome": false,
+        "theme": "dark"
+    }
+}<!DOCTYPE html>
 <html lang="en">
 <head>
   <!-- Azure Speech SDK -->
@@ -2317,18 +2587,10 @@ if __name__ == "__main__":
   <script src="renderer.js"></script>
   <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAHVSURBVHgB7dqxS9tRFMfxT5PVQNpc3CaLSBcHcQrUjv0DnCq4dGgROpQOQQp1bBUE8S8QCh3rP9DBwRyKoLh1aKGDCCEdSvP6ejkERB2SPH3e930fPyBcIAT57nv33j13F0mSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSJEmSpKyJhT6APLg4XYp/CX0QeQq4Wj3Tun3Vj8PZy5GAq9WjeHJxmpJm6INYr9H/9PRtf3nu65AA1yU2Z8Lciz/j8PvA20//Kg0mWv+c3v/29K5v3I0NWg3//7VpfgogSZKkLDAQEgKBkBAIhIRAIJgHAAHCTAEoBEDgGEBgeGJp1m3QlTIAEARa/wzH/v35Z/51JwSC6gUAQcC5gBBQn1AAgMA9oFEIhIJAoBmJQJ2AgWYk9IMABppmgICAsRVAQNA6BIy9AgSEnwICghbA9AMAAM1CAIBmZQDQ6H+AUd0KIAIAzZwAQDMrgIAN8AAGum6DQKMOEAQDAQI2aAIBQeMQCASCVsCAt0GXK4CAgOZlwL8CCAgYEAKBQCAIBAKQ1RBYGj5uDoSMQDA5BKL7i9PG2+Pb1gOP/6OqA2DqL84a33/Xrvv/3mU8d0Bw99Bo9f+/S3jugODuvtHu/36XLw6fU8UReP4/nff4btoHwN8h8P77XK9F4M+T4LX7/68NAAThv0FA+6+g7AUAYnQINAyAQCDoCAJ+IxL3IOggBIJGIUDgPoAGAQDCCBEA3w6g6zYAn2qMBQDqG5r3/wEl5PGhx7+yzAAAAABJRU5ErkJggg==">
 </body>
-</html>// Logo as base64 (Interview Helper Logo)
-const LOGO_BASE64 = `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAI2SURBVHgB7du/SxVBFMDxI66+8A8QQVAQDNHAoL/hj4yIhIaoqIMLoiBYSGghESLqQnCRIFiI5gJ3ERJBsBA1f3L1vYV74V3I57nJZ97nA5f7dnYPs7+ZubOz18wYY4wxxhhjjDHGGGOMMcYYY4wxJipV+AOoU3WNVGXeT83Rdk2P/0bNobzU6r8DqMHKNf0KVy1qvhclhOJq5KzGPn2X+RgBlFArZzQe3Iu8rI8AZql7Mxp7Nf/pqCzBQyio6s5oPJvReLOv9+LlAuAhFFY1ezX/0t/X7fZ9X4KHUGDtG9z8tC+49+7mh3w5BiG/AfKrlbPxfam6i3tuJ9d3AQ8hL1rV7DEbT3MI2U+BDyFP2nR22HeRfHt/oE/Ikw5u/eo7eA9+6G/kPXvJj3kJ5HqvebDXe/OjnPzE18C7nN36i6Kd/NQ3Qb3+47/BTZ3Kq+hL57z/e+tyN6eT72TqTfC8Xv+1yGl9z+f5L+BzwMfQTnz9qjY+TJX8Tq5/+CqwF/k6+a0QboN+vx1BdeJj3xz/DPHwm8AnwPPIn8iX0T+Q/5Ivf4d4G9R7ga8R/5If0Px5vV+gfQF+DfD8xzj/17QX+lWRJuBp3d5AXBz55k/lI+BB6FdFkYCnN4Cc3u3tn0d+A+wED4J2TeAZ4n4oJz+gp+DeCHIEuA34r0L3gKd1elP5A7jPzc8ngBPAJ8B1gN+LXgTt2j0Q9zG2L78JegjsBswG+O2Ih6Bdszv7A7v4s38U/Ax4GriV3vyCQ9Cuzs52qVebk7/JvS87PwT+BJwLtPn/Bb3nqEPQzssRwHqZJ78UuvE38hJ4KfCGV+z+LCHVxN7Qk1+G0u/PElJN7I1i89pKvT9LSDWxN4rNayv1/izhH4PzcgLwSgibn8PH4FZ9/x5C3v33/ZlKz9Pn5e+K3/P8eY3n7/Oa/wDTUcZhBKEosQAAAABJRU5ErkJggg==`;
+</html>
 
-// Alternative simpler logo
-const SIMPLE_LOGO = `data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAIISURBVHgB7doxSxxRFMDxY1dRkAh2YmmljY0hWCQWgiTYZWPnpxAL09gIYhFBW8HOVhD8GCaNRTo7CwvxGygiohvu/HYea2EjJ3M5d5/3e8BdHrw7L/fuf87s7szMzMzMzMzMzMzMzMzMzMzMLE0ZRrQqG9Q+hjXqGfM2YV/XoZJEXEYMqaK2H+kVdZf5O6ygNAGYVtMrtUfdYH5PXXMwAi1g0z87/J7gYIwfQ9D/d7M1LItYAeQg/wf3OMr/GcPaxgKQ9d4w6N+0YDYoyQoIADF+7o9O1Y5/fwYIAGF/Nf3g1/VPAz6MhR8GgLQ85R2fBkgBQAoAUgCQAoAUAKQAYBSATgLQFYAOAtDmAFQANKEBUOVp/CQAiSY6AAoZgI7Gp7kjrH8A9Pd+cz8KQJvH/M5mAlBFSH4Hw3vLqQagqNt9DYB2O9u3dd1uBrAC9J8N6v9b5/Y/aAWE2n8VQ1t/Yts2Vn2uAm3b7WQ1dZUBKGPgHesr6yG2ALqZ27a1ip4wtsd1/dv8KphnAa5Te9QZ9YU6pXaoD9Ta9n1eNfUA7M9nK3v3+V1mzQfggLE+UbBvB69lIQUAqX8C0I/JxQqIvgIkACAFACkASAFACgBSAJACgBQApAAgBQApAEgBQAoAUgCQAoAUAKQAYFYAOReAZQBYAYBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgGUAmB+AZgVgmQCWAWAZAJYBYH4AmhWAZQJYBoBlAFgGgPkBaFYAlglgGQCWAWAZAOYHoFkBgGUAlgFYBmB+AK6bmZmZWe9mZmZmZmZmZmZmZmZmZmbWx/oEpsWf3wBmW7kAAAAASUVORK5CYII=`;
 
-// Export logos
-module.exports = {
-    LOGO_BASE64,
-    SIMPLE_LOGO
-};const { LOGO_BASE64 } = require('./logo.js');
-
+const { LOGO_BASE64 } = require('./logo.js');
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, screen } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -2339,6 +2601,9 @@ let tray = null;
 let pythonServer = null;
 let isMinimized = false;
 
+/* ======================================================
+   CREATE MAIN WINDOW
+   ====================================================== */
 function createWindow() {
     mainWindow = new BrowserWindow({
         width: 800,
@@ -2348,10 +2613,15 @@ function createWindow() {
         frame: false,
         transparent: true,
         backgroundColor: '#00000000',
-        show: true,
 
-        // ✅ VISIBLE in taskbar & Alt-Tab
+        // 🔴 IMPORTANT FIX: start hidden
+        show: false,
+
+        // 🔥 visible in Alt+Tab when restored
         skipTaskbar: false,
+
+        // 🔥 stay above all apps
+        alwaysOnTop: true,
 
         webPreferences: {
             nodeIntegration: false,
@@ -2360,13 +2630,32 @@ function createWindow() {
         }
     });
 
-    // 🔓 ALLOW screen sharing / recording
+    // 🔓 Allow screen capture
     mainWindow.setContentProtection(false);
+
+    // 🔥 Reinforce top-most behavior
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
 
     mainWindow.loadFile('index.html');
 
+    // ✅ CRITICAL WINDOWS FIX (NO LOGIC CHANGE)
+    mainWindow.once('ready-to-show', () => {
+        mainWindow.show();
+        mainWindow.focus();
+        mainWindow.setAlwaysOnTop(true, 'screen-saver');
+    });
+
+    // 🔐 Ensure taskbar state stays correct
+    mainWindow.on('show', () => {
+        if (!isMinimized) {
+            mainWindow.setSkipTaskbar(false);
+        }
+    });
+
     createTray();
     startBackend();
+
+    /* ================= IPC ================= */
 
     ipcMain.on('minimize-window', minimizeToCircle);
     ipcMain.on('close-window', () => app.quit());
@@ -2377,8 +2666,36 @@ function createWindow() {
             circleWindow.setPosition(x, y);
         }
     });
+
+    /* ======================================================
+       PREVENT AUTO HIDE / AUTO MINIMIZE
+       ====================================================== */
+
+    mainWindow.on('minimize', (e) => {
+        e.preventDefault();
+        if (!isMinimized) {
+            mainWindow.show();
+            mainWindow.focus();
+        }
+    });
+
+    mainWindow.on('blur', () => {
+        if (!isMinimized && mainWindow) {
+            mainWindow.show();
+            mainWindow.setAlwaysOnTop(true, 'screen-saver');
+        }
+    });
+
+    mainWindow.on('hide', () => {
+        if (!isMinimized) {
+            mainWindow.show();
+        }
+    });
 }
 
+/* ======================================================
+   CIRCLE WINDOW
+   ====================================================== */
 function createCircleWindow(x, y) {
     if (circleWindow) {
         circleWindow.focus();
@@ -2394,10 +2711,7 @@ function createCircleWindow(x, y) {
         transparent: true,
         backgroundColor: '#00000000',
         alwaysOnTop: true,
-
-        // ❌ Circle hidden from taskbar (normal behavior)
         skipTaskbar: true,
-
         resizable: false,
         movable: false,
         minimizable: false,
@@ -2412,11 +2726,10 @@ function createCircleWindow(x, y) {
         }
     });
 
-    // 🔓 Allow capture
     circleWindow.setContentProtection(false);
+    circleWindow.setAlwaysOnTop(true, 'screen-saver');
 
     circleWindow.loadFile('circle.html');
-    circleWindow.setIgnoreMouseEvents(false);
 
     circleWindow.on('closed', () => {
         circleWindow = null;
@@ -2425,12 +2738,16 @@ function createCircleWindow(x, y) {
     return circleWindow;
 }
 
+/* ======================================================
+   MINIMIZE / RESTORE
+   ====================================================== */
 function minimizeToCircle() {
     if (!mainWindow) return;
 
+    isMinimized = true;
+
     mainWindow.hide();
     mainWindow.setSkipTaskbar(true);
-    isMinimized = true;
 
     const { width, height } = screen.getPrimaryDisplay().workAreaSize;
     const circleX = width - 100;
@@ -2444,16 +2761,21 @@ function minimizeToCircle() {
 function restoreFromCircle() {
     if (!mainWindow) return;
 
+    isMinimized = false;
+
+    mainWindow.setSkipTaskbar(false);
     mainWindow.show();
     mainWindow.focus();
-    mainWindow.setSkipTaskbar(false);
-    isMinimized = false;
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
 
     if (circleWindow) {
         circleWindow.hide();
     }
 }
 
+/* ======================================================
+   TRAY
+   ====================================================== */
 function createTray() {
     const icon = nativeImage.createFromDataURL(LOGO_BASE64);
     tray = new Tray(icon);
@@ -2483,6 +2805,9 @@ function createTray() {
     });
 }
 
+/* ======================================================
+   BACKEND
+   ====================================================== */
 function startBackend() {
     const pythonPath = process.platform === 'win32' ? 'python' : 'python3';
     const scriptPath = path.join(__dirname, 'main.py');
@@ -2493,6 +2818,9 @@ function startBackend() {
     pythonServer.stderr.on('data', d => console.error(`Backend Error: ${d}`));
 }
 
+/* ======================================================
+   APP LIFECYCLE
+   ====================================================== */
 app.whenReady().then(createWindow);
 
 app.on('window-all-closed', () => {
@@ -2513,57 +2841,54 @@ app.on('before-quit', () => {
     if (circleWindow) circleWindow.close();
 });
 {
-  "name": "interview-assistant",
+  "name": "interview-helper",
   "version": "1.0.0",
-  "description": "Interview Helper AI Assistant",
+  "description": "Interview Helper Desktop App",
+  "author": "Interview Helper",
   "main": "main.js",
+
   "scripts": {
     "start": "electron .",
-    "dev": "electron . --debug",
     "build": "electron-builder"
   },
-  "dependencies": {
-    "electron": "^25.0.0"
-  },
+
   "devDependencies": {
+    "electron": "^25.0.0",
     "electron-builder": "^24.6.4"
   },
+
   "build": {
-    "appId": "com.interviewhelper.private",
+    "appId": "com.interviewhelper.app",
     "productName": "Interview Helper",
+
     "directories": {
       "output": "dist"
     },
+
     "files": [
       "**/*",
-      "!**/node_modules/*/{CHANGELOG.md,README.md,README,readme.md,readme}",
-      "!**/node_modules/*/{test,__tests__,tests,powered-test,example,examples}",
-      "!**/node_modules/*.d.ts",
-      "!**/*.iml",
-      "!circle.html"  
+      {
+        "from": "backend",
+        "to": "backend"
+      }
     ],
+
     "win": {
       "target": "nsis",
       "icon": "assets/icon.ico"
     },
-    "mac": {
-      "target": "dmg",
-      "icon": "assets/icon.icns"
-    },
-    "linux": {
-      "target": "AppImage",
-      "icon": "assets/icon.png"
-    },
+
     "nsis": {
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Interview Helper"
     }
-  },
-  "author": "",
-  "license": "MIT"
-}const { contextBridge, ipcRenderer } = require('electron');
+  }
+}
+const { contextBridge, ipcRenderer } = require('electron');
 
 // For main window (index.html)
 contextBridge.exposeInMainWorld('api', {
@@ -2642,6 +2967,11 @@ document.addEventListener("DOMContentLoaded", function() {
     let lastPartialText = "";
     let lastFinalText = "";
     let duplicateBlockList = new Set();
+
+
+    let isAutoScrollEnabled = false;
+let lastUserScrollTime = Date.now();
+
     
     // ================= ELEMENTS =================
     const qaQuestion = document.getElementById("qaQuestion");
@@ -2801,92 +3131,114 @@ function updateQAPanelIndicators(isMicMuted, isSystemMuted) {
         return false;
     }
     
-    // ================= SSE CONNECTION =================
-    function connectSSE() {
-        if (sseConnection) {
-            console.log("🔄 Closing existing SSE connection");
-            sseConnection.close();
-            sseConnection = null;
-        }
-        
-        console.log("🔄 Connecting to SSE stream...");
-        
-        try {
-            sseConnection = new EventSource("http://127.0.0.1:8000/stream");
-            
-            sseConnection.onopen = () => {
-                console.log("✅ SSE connection established");
-                reconnectAttempts = 0;
-            };
-            
-            sseConnection.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    
-                    if (data.type === "transcript") {
-                        handleTranscript(data);
-                    } else if (data.type === "ai_start") {
-                        console.log("🤖 AI started generating...");
-                        qaAnswer.innerHTML = '<div class="thinking">AI is generating answer...</div>';
-                    } else if (data.type === "ai_chunk") {
-                        console.log("🤖 AI chunk received");
-                        qaAnswer.innerHTML = data.content;
-                        scrollToBottom();
-                    } else if (data.type === "ai_complete") {
-                        console.log("✅ AI response complete");
-                        isAiResponding = false;
-                        btnAnswer.disabled = false;
-                        qaAnswer.innerHTML = data.content;
-                        scrollToBottom();
-                        
-                        // Clear for next question after AI completes
-                        setTimeout(() => {
-                            qaQuestion.textContent = "Listening for next question...";
-                            qaQuestion.classList.remove("partial-text");
-                            currentTranscript = "";
-                            lastProcessedText = "";
-                            lastPartialText = "";
-                            lastFinalText = "";
-                            duplicateBlockList.clear();
-                        }, 500);
-                    } else if (data.type === "ai_error") {
-                        console.error("❌ AI error:", data.error);
-                        qaAnswer.innerHTML = `<div class="error">AI Error: ${data.error}</div>`;
-                        isAiResponding = false;
-                        btnAnswer.disabled = false;
-                    }
-                } catch (error) {
-                    console.error("❌ SSE parse error:", error);
-                }
-            };
-            
-            sseConnection.onerror = (error) => {
-                console.error("❌ SSE connection error:", error);
-                
-                if (sseConnection) {
-                    sseConnection.close();
-                    sseConnection = null;
-                }
-                
-                reconnectAttempts++;
-                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                    console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-                    setTimeout(connectSSE, 1000);
-                } else {
-                    console.error("❌ Max reconnection attempts reached");
-                    if (qaQuestion) {
-                        qaQuestion.textContent = "Connection lost. Please refresh.";
-                    }
-                }
-            };
-            
-        } catch (error) {
-            console.error("❌ Failed to create SSE connection:", error);
-            setTimeout(connectSSE, 1000);
-        }
+   
+// ================= SSE CONNECTION =================
+function connectSSE() {
+    if (sseConnection) {
+        console.log("🔄 Closing existing SSE connection");
+        sseConnection.close();
+        sseConnection = null;
     }
     
-    // ================= TRANSCRIPT HANDLING =================
+    console.log("🔄 Connecting to SSE stream...");
+    
+    try {
+        sseConnection = new EventSource("http://127.0.0.1:8000/stream");
+        
+        sseConnection.onopen = () => {
+            console.log("✅ SSE connection established");
+            reconnectAttempts = 0;
+        };
+        
+        sseConnection.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === "transcript") {
+                    handleTranscript(data);
+                } else if (data.type === "ai_start") {
+                    console.log("🤖 AI started generating...");
+                    qaAnswer.innerHTML = '<div class="thinking">AI is generating answer...</div>';
+                } else if (data.type === "ai_token") {
+                    // 🔥 IMMEDIATE token streaming
+                    // console.log("🤖 AI token:", data.content);
+                    // You can optionally show typing animation here
+                } else if (data.type === "ai_word") {
+                    // 🔥 Word-by-word streaming (MAIN DISPLAY)
+                    console.log("🤖 AI word received:", data.content);
+                    
+                    // Handle the response display
+                    if (qaAnswer.innerHTML.includes('thinking')) {
+                        // Replace thinking indicator with first word
+                        qaAnswer.innerHTML = data.content;
+                    } else {
+                        // Append to existing content
+                        qaAnswer.innerHTML += data.content;
+                    }
+                    
+                    // 🔥 Auto-scroll to keep latest content visible
+                    scrollToBottom();
+                    
+                } else if (data.type === "ai_complete") {
+                    console.log("✅ AI response complete");
+                    isAiResponding = false;
+                    btnAnswer.disabled = false;
+                    
+                    // 🔥 Ensure final formatting is applied
+                    if (data.content) {
+                        qaAnswer.innerHTML = data.content;
+                    }
+                    
+                    scrollToBottom();
+                    
+                    // Clear for next question after AI completes
+                    setTimeout(() => {
+                        qaQuestion.textContent = "Listening for next question...";
+                        qaQuestion.classList.remove("partial-text");
+                        currentTranscript = "";
+                        lastProcessedText = "";
+                        lastPartialText = "";
+                        lastFinalText = "";
+                        duplicateBlockList.clear();
+                    }, 500);
+                } else if (data.type === "ai_error") {
+                    console.error("❌ AI error:", data.error);
+                    qaAnswer.innerHTML = `<div class="error">AI Error: ${data.error}</div>`;
+                    isAiResponding = false;
+                    btnAnswer.disabled = false;
+                }
+            } catch (error) {
+                console.error("❌ SSE parse error:", error);
+            }
+        };
+        
+        sseConnection.onerror = (error) => {
+            console.error("❌ SSE connection error:", error);
+            
+            if (sseConnection) {
+                sseConnection.close();
+                sseConnection = null;
+            }
+            
+            reconnectAttempts++;
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                setTimeout(connectSSE, 1000);
+            } else {
+                console.error("❌ Max reconnection attempts reached");
+                if (qaQuestion) {
+                    qaQuestion.textContent = "Connection lost. Please refresh.";
+                }
+            }
+        };
+        
+    } catch (error) {
+        console.error("❌ Failed to create SSE connection:", error);
+        setTimeout(connectSSE, 1000);
+    }
+}
+    
+  
    // ================= TRANSCRIPT HANDLING =================
 function handleTranscript(data) {
     const text = data.text.trim();
@@ -3159,7 +3511,7 @@ function handleTranscript(data) {
         }
     }
     
-    // ================= ANSWER BUTTON =================
+ 
     // ================= ANSWER BUTTON =================
 async function handleAnswerButton() {
     // 🔥 REQUIREMENT: Check if text is empty and show alert IN ANSWER AREA
@@ -3213,7 +3565,7 @@ async function handleAnswerButton() {
     qaAnswer.innerHTML = '<div class="thinking">AI is generating interview answer...</div>';
     
     try {
-        const response = await fetch("http://127.0.0.1:8000/api/answer-stream", {
+        const response = await fetch("http://127.0.0.1:8000/api/answer-stream-fast", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ text: questionToSend })
@@ -4244,6 +4596,491 @@ function setupCodeCopyButtons() {
         }
     });
 }
+
+// ================= ARROW KEY NAVIGATION =================
+function setupArrowKeyNavigation() {
+    console.log("⌨️ Setting up arrow key navigation...");
+    
+    document.addEventListener('keydown', function(event) {
+        const qaAnswer = document.getElementById("qaAnswer");
+        if (!qaAnswer || qaAnswer.innerHTML.trim() === '') return;
+        
+        // 🔥 Handle DOWN arrow key
+        if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            
+            // Calculate scroll amount (1/10th of the visible area)
+            const scrollAmount = Math.min(100, qaAnswer.clientHeight / 10);
+            
+            // Scroll down
+            qaAnswer.scrollTop += scrollAmount;
+            
+            // Disable auto-scroll when user manually scrolls
+            isAutoScrollEnabled = false;
+            lastUserScrollTime = Date.now();
+            
+            console.log(`⬇️ Manual scroll down ${scrollAmount}px`);
+        }
+        
+        // 🔥 Handle UP arrow key
+        else if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            
+            const scrollAmount = Math.min(100, qaAnswer.clientHeight / 10);
+            qaAnswer.scrollTop -= scrollAmount;
+            
+            isAutoScrollEnabled = false;
+            lastUserScrollTime = Date.now();
+            
+            console.log(`⬆️ Manual scroll up ${scrollAmount}px`);
+        }
+        
+        // 🔥 Page Down for larger scroll
+        else if (event.key === 'PageDown') {
+            event.preventDefault();
+            qaAnswer.scrollTop += qaAnswer.clientHeight * 0.8;
+            isAutoScrollEnabled = false;
+            lastUserScrollTime = Date.now();
+        }
+        
+        // 🔥 Page Up for larger scroll up
+        else if (event.key === 'PageUp') {
+            event.preventDefault();
+            qaAnswer.scrollTop -= qaAnswer.clientHeight * 0.8;
+            isAutoScrollEnabled = false;
+            lastUserScrollTime = Date.now();
+        }
+        
+        // 🔥 REMOVED: Home and End key functionality (as per your requirement)
+        // Users will manually scroll instead
+    });
+}
+
+
+
+function setupManualScrollControls() {
+    console.log("🔄 Setting up manual scroll controls...");
+    
+    const qaAnswer = document.getElementById("qaAnswer");
+    if (!qaAnswer) return;
+    
+    // Create minimal scroll control overlay (only visible on hover)
+    const scrollControls = document.createElement('div');
+    scrollControls.className = 'manual-scroll-controls';
+    scrollControls.style.cssText = `
+        position: absolute;
+        right: 8px;
+        bottom: 8px;
+        display: flex;
+        gap: 4px;
+        opacity: 0;
+        transition: opacity 0.3s;
+        z-index: 50;
+    `;
+    
+    // Create DOWN button (only one button needed since we have arrow keys)
+    const scrollBtn = document.createElement('button');
+    scrollBtn.innerHTML = '↓';
+    scrollBtn.title = 'Manual scroll (Use Arrow Keys)';
+    scrollBtn.style.cssText = `
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        background: rgba(15, 23, 42, 0.9);
+        color: white;
+        border: 1px solid #3b82f6;
+        cursor: pointer;
+        font-size: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    `;
+    
+    scrollBtn.addEventListener('click', () => {
+        // Manual scroll down when button clicked
+        qaAnswer.scrollTop += 100;
+        isAutoScrollEnabled = false;
+        lastUserScrollTime = Date.now();
+    });
+    
+    scrollControls.appendChild(scrollBtn);
+    
+    // Add hover effect to show controls
+    qaAnswer.addEventListener('mouseenter', () => {
+        scrollControls.style.opacity = '1';
+    });
+    
+    qaAnswer.addEventListener('mouseleave', () => {
+        scrollControls.style.opacity = '0';
+    });
+    
+    // Add to answer panel
+    qaAnswer.parentNode.style.position = 'relative';
+    qaAnswer.parentNode.appendChild(scrollControls);
+    
+    // Setup arrow key navigation
+    setupArrowKeyNavigation();
+}
+
+// ================= SSE CONNECTION =================
+function connectSSE() {
+    if (sseConnection) {
+        console.log("🔄 Closing existing SSE connection");
+        sseConnection.close();
+        sseConnection = null;
+    }
+    
+    console.log("🔄 Connecting to SSE stream...");
+    
+    try {
+        sseConnection = new EventSource("http://127.0.0.1:8000/stream");
+        
+        sseConnection.onopen = () => {
+            console.log("✅ SSE connection established");
+            reconnectAttempts = 0;
+        };
+        
+        sseConnection.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === "transcript") {
+                    handleTranscript(data);
+                } 
+                
+                // 🔥 AI RESPONSE HANDLING - UPDATED FOR FIRST TOKEN DISPLAY
+                else if (data.type === "ai_start") {
+                    console.log("🤖 AI started generating...");
+                    qaAnswer.innerHTML = '<div class="thinking">AI is generating answer...</div>';
+                    
+                    // 🔥 CRITICAL: Reset scroll to TOP (show first token at top)
+                    qaAnswer.scrollTop = 0;
+                    
+                    // 🔥 Disable auto-scroll by default (stay at first token)
+                    isAutoScrollEnabled = false;
+                    lastUserScrollTime = Date.now();
+                    
+                    console.log("🚫 Auto-scroll DISABLED - Answer starts at first token");
+                }
+                
+                else if (data.type === "ai_token") {
+                    // 🔥 IMMEDIATE token streaming (optional visual feedback)
+                    // console.log("🤖 AI token:", data.content);
+                    // Can add typing animation here if needed
+                }
+                
+                else if (data.type === "ai_word") {
+                    // 🔥 Word-by-word streaming (MAIN DISPLAY)
+                    console.log("🤖 AI word received:", data.content);
+                    
+                    // Handle the response display
+                    if (qaAnswer.innerHTML.includes('thinking')) {
+                        // Replace thinking indicator with first word
+                        qaAnswer.innerHTML = data.content;
+                        
+                        // 🔥 First word appears at TOP (scroll already at 0)
+                        console.log("📝 First word displayed at top position");
+                    } else {
+                        // Append to existing content
+                        qaAnswer.innerHTML += data.content;
+                        
+                        // 🔥 LIMITED auto-scroll: Only if enabled AND user hasn't scrolled
+                        const timeSinceLastScroll = Date.now() - lastUserScrollTime;
+                        if (isAutoScrollEnabled && timeSinceLastScroll > AUTO_SCROLL_THRESHOLD) {
+                            // Small incremental scroll (not to bottom)
+                            qaAnswer.scrollTop += 30; // Just enough to see new content
+                        }
+                    }
+                }
+                
+                else if (data.type === "ai_chunk") {
+                    // 🔥 For chunk-based streaming (alternative to word-by-word)
+                    console.log("🤖 AI chunk received");
+                    
+                    if (qaAnswer.innerHTML.includes('thinking')) {
+                        qaAnswer.innerHTML = data.content;
+                        qaAnswer.scrollTop = 0; // Ensure at top
+                    } else {
+                        qaAnswer.innerHTML += data.content;
+                        
+                        // 🔥 Optional: Small scroll if auto-scroll enabled
+                        if (isAutoScrollEnabled) {
+                            const timeSinceLastScroll = Date.now() - lastUserScrollTime;
+                            if (timeSinceLastScroll > AUTO_SCROLL_THRESHOLD) {
+                                qaAnswer.scrollTop += 40;
+                            }
+                        }
+                    }
+                }
+                
+                else if (data.type === "ai_complete") {
+                    console.log("✅ AI response complete");
+                    isAiResponding = false;
+                    btnAnswer.disabled = false;
+                    
+                    // 🔥 FINAL FORMATTING (if provided)
+                    if (data.content) {
+                        qaAnswer.innerHTML = data.content;
+                    }
+                    
+                    // 🔥 IMPORTANT: DO NOT auto-scroll to bottom on completion
+                    // Stay at current scroll position (user might be reading)
+                    console.log("📝 AI response complete - Staying at current position");
+                    
+                    // 🔥 Add completion marker (optional)
+                    if (!qaAnswer.innerHTML.includes('ai-complete-marker')) {
+                        const completeMarker = document.createElement('div');
+                        completeMarker.className = 'ai-complete-marker';
+                        completeMarker.innerHTML = '<div style="color: #10b981; font-size: 12px; margin-top: 10px; padding: 5px; border-top: 1px solid #334155;">✓ AI response complete</div>';
+                        qaAnswer.appendChild(completeMarker);
+                    }
+                    
+                    // Clear for next question after AI completes
+                    setTimeout(() => {
+                        qaQuestion.textContent = "Listening for next question...";
+                        qaQuestion.classList.remove("partial-text");
+                        currentTranscript = "";
+                        lastProcessedText = "";
+                        lastPartialText = "";
+                        lastFinalText = "";
+                        duplicateBlockList.clear();
+                    }, 500);
+                }
+                
+                else if (data.type === "ai_error") {
+                    console.error("❌ AI error:", data.error);
+                    qaAnswer.innerHTML = `<div class="error">AI Error: ${data.error}</div>`;
+                    isAiResponding = false;
+                    btnAnswer.disabled = false;
+                }
+                
+                // 🔥 NEW: Handle ai_stream type (for ultra-fast endpoint)
+                else if (data.type === "ai_stream") {
+                    console.log("⚡ AI stream content:", data.content);
+                    
+                    if (qaAnswer.innerHTML.includes('thinking')) {
+                        qaAnswer.innerHTML = data.content;
+                        qaAnswer.scrollTop = 0; // Start at top
+                    } else {
+                        qaAnswer.innerHTML += data.content;
+                        
+                        // 🔥 Minimal auto-scroll only if explicitly enabled
+                        if (isAutoScrollEnabled) {
+                            const timeSinceLastScroll = Date.now() - lastUserScrollTime;
+                            if (timeSinceLastScroll > AUTO_SCROLL_THRESHOLD) {
+                                qaAnswer.scrollTop += 20; // Very small scroll
+                            }
+                        }
+                    }
+                }
+                
+            } catch (error) {
+                console.error("❌ SSE parse error:", error);
+            }
+        };
+        
+        sseConnection.onerror = (error) => {
+            console.error("❌ SSE connection error:", error);
+            
+            if (sseConnection) {
+                sseConnection.close();
+                sseConnection = null;
+            }
+            
+            reconnectAttempts++;
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                setTimeout(connectSSE, 1000);
+            } else {
+                console.error("❌ Max reconnection attempts reached");
+                if (qaQuestion) {
+                    qaQuestion.textContent = "Connection lost. Please refresh.";
+                }
+            }
+        };
+        
+    } catch (error) {
+        console.error("❌ Failed to create SSE connection:", error);
+        setTimeout(connectSSE, 1000);
+    }
+}
+// ================= ENHANCED SCROLL BUTTONS =================
+function addScrollButtons() {
+    // Create scroll up button
+    const scrollUpBtn = document.createElement('button');
+    scrollUpBtn.id = 'scrollUpBtn';
+    scrollUpBtn.innerHTML = '↑';
+    scrollUpBtn.title = 'Scroll up (Arrow Up)';
+    scrollUpBtn.style.cssText = `
+        position: absolute;
+        right: 10px;
+        top: 10px;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        background: rgba(15, 23, 42, 0.8);
+        color: white;
+        border: 1px solid #3b82f6;
+        cursor: pointer;
+        font-size: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+    `;
+    
+    // Create scroll down button
+    const scrollDownBtn = document.createElement('button');
+    scrollDownBtn.id = 'scrollDownBtn';
+    scrollDownBtn.innerHTML = '↓';
+    scrollDownBtn.title = 'Scroll down (Arrow Down)';
+    scrollDownBtn.style.cssText = `
+        position: absolute;
+        right: 10px;
+        bottom: 10px;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        background: rgba(15, 23, 42, 0.8);
+        color: white;
+        border: 1px solid #3b82f6;
+        cursor: pointer;
+        font-size: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+    `;
+    
+    // Create auto-scroll toggle button
+    const autoScrollBtn = document.createElement('button');
+    autoScrollBtn.id = 'autoScrollBtn';
+    autoScrollBtn.innerHTML = '🔒';
+    autoScrollBtn.title = 'Toggle auto-scroll (Ctrl+Space)';
+    autoScrollBtn.style.cssText = `
+        position: absolute;
+        right: 10px;
+        top: 50px;
+        width: 30px;
+        height: 30px;
+        border-radius: 50%;
+        background: rgba(59, 130, 246, 0.8);
+        color: white;
+        border: 1px solid #3b82f6;
+        cursor: pointer;
+        font-size: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 100;
+    `;
+    
+    // Add event listeners
+    scrollUpBtn.addEventListener('click', () => {
+        const qaAnswer = document.getElementById("qaAnswer");
+        if (qaAnswer) {
+            qaAnswer.scrollTop -= 100;
+            showScrollIndicator('up');
+        }
+    });
+    
+    scrollDownBtn.addEventListener('click', () => {
+        const qaAnswer = document.getElementById("qaAnswer");
+        if (qaAnswer) {
+            qaAnswer.scrollTop += 100;
+            showScrollIndicator('down');
+        }
+    });
+    
+    autoScrollBtn.addEventListener('click', () => {
+        isAutoScrollEnabled = !isAutoScrollEnabled;
+        autoScrollBtn.innerHTML = isAutoScrollEnabled ? '🔒' : '🔓';
+        autoScrollBtn.title = isAutoScrollEnabled ? 'Auto-scroll: ON (Ctrl+Space)' : 'Auto-scroll: OFF (Ctrl+Space)';
+        autoScrollBtn.style.background = isAutoScrollEnabled ? 'rgba(59, 130, 246, 0.8)' : 'rgba(239, 68, 68, 0.8)';
+        showScrollIndicator(isAutoScrollEnabled ? 'auto' : 'manual');
+    });
+    
+    // Add buttons to the answer panel
+    const qaAnswer = document.getElementById("qaAnswer");
+    if (qaAnswer && qaAnswer.parentNode) {
+        qaAnswer.parentNode.style.position = 'relative';
+        qaAnswer.parentNode.appendChild(scrollUpBtn);
+        qaAnswer.parentNode.appendChild(scrollDownBtn);
+        qaAnswer.parentNode.appendChild(autoScrollBtn);
+    }
+}
+
+// ================= ENHANCED HOTKEYS =================
+function setupHotkeys() {
+    console.log("⌨️ Setting up enhanced hotkeys...");
+    
+    document.addEventListener('keydown', function(event) {
+        // 🔥 ANSWER BUTTON - Space key
+        if (event.code === 'Space' && !event.repeat && !event.ctrlKey && !event.altKey) {
+            console.log("⌨️ Space key pressed - Triggering answer");
+            event.preventDefault();
+            if (btnAnswer && !btnAnswer.disabled) {
+                handleAnswerButton();
+            }
+        }
+        
+        // 🔥 MICROPHONE TOGGLE - M key
+        if (event.code === 'KeyM' && !event.repeat) {
+            console.log("⌨️ M key pressed - Toggling microphone");
+            event.preventDefault();
+            toggleMic();
+        }
+        
+        // 🔥 CLEAR BUTTON - C key
+        if (event.code === 'KeyC' && !event.repeat) {
+            console.log("⌨️ C key pressed - Clearing text");
+            event.preventDefault();
+            if (btnClear) {
+                handleClearButton();
+            }
+        }
+        
+        // 🔥 SYSTEM AUDIO TOGGLE - N key
+        if (event.code === 'KeyN' && !event.repeat) {
+            console.log("⌨️ N key pressed - Toggling system audio");
+            event.preventDefault();
+            toggleSystem();
+        }
+        
+        // 🔥 AUTO-SCROLL TOGGLE - Ctrl+Space
+        if (event.ctrlKey && event.code === 'Space' && !event.repeat) {
+            console.log("⌨️ Ctrl+Space pressed - Toggling auto-scroll");
+            event.preventDefault();
+            isAutoScrollEnabled = !isAutoScrollEnabled;
+            showScrollIndicator(isAutoScrollEnabled ? 'auto' : 'manual');
+        }
+        
+        // 🔥 JUMP TO TOP - Home key
+        if (event.code === 'Home' && !event.repeat) {
+            console.log("⌨️ Home key pressed - Jumping to top");
+            event.preventDefault();
+            const qaAnswer = document.getElementById("qaAnswer");
+            if (qaAnswer) {
+                qaAnswer.scrollTop = 0;
+                showScrollIndicator('up');
+            }
+        }
+        
+        // 🔥 JUMP TO BOTTOM - End key
+        if (event.code === 'End' && !event.repeat) {
+            console.log("⌨️ End key pressed - Jumping to bottom");
+            event.preventDefault();
+            const qaAnswer = document.getElementById("qaAnswer");
+            if (qaAnswer) {
+                scrollToBottom();
+                showScrollIndicator('down');
+            }
+        }
+    });
+    
+    console.log("✅ Enhanced hotkeys setup complete");
+}
+
     // ================= INITIALIZATION =================
     function initialize() {
     console.log("🔧 Initializing application...");
@@ -4259,11 +5096,19 @@ function setupCodeCopyButtons() {
     setupChatBox();
      setupHotkeys(); // 🔥 ADD THIS LINE
     setupCodeCopyButtons();
+
+  // 🔥 ADD SCROLL NAVIGATION
+     setupArrowKeyNavigation();
+    addScrollControlButtons();
+
     // Initialize status - Mic starts UNMUTED
     micMuted = false;
     systemMuted = false;
     updateAudioStatus();
-        
+         isAutoScrollEnabled = false; // Start with auto-scroll OFF
+    
+    console.log("✅ Application initialized with scroll controls");
+
         // Show first step
         document.querySelectorAll(".step").forEach(step => step.classList.remove("active"));
         document.querySelector(".step-1")?.classList.add("active");
@@ -4308,6 +5153,10 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+function scrollToBottom() {
+    if (!qaAnswer) return;
+    qaAnswer.scrollTop = qaAnswer.scrollHeight;
 }:root {
   --bg-card: #ffffff;
   --bg-header: #f3f4f6;
@@ -5841,4 +6690,238 @@ button, input, textarea, select {
     color: #64748b;
     text-align: right;
     user-select: none;
+}
+
+/* Add to your existing CSS or create a new style section */
+.qa-answer {
+    min-height: 60px;
+    max-height: 60vh;
+    overflow-y: auto;
+    padding-right: 8px;
+    transition: all 0.3s ease;
+}
+
+/* Smooth word-by-word animation */
+.ai-word {
+    display: inline;
+    animation: wordAppear 0.1s ease-out;
+}
+
+@keyframes wordAppear {
+    from {
+        opacity: 0;
+        transform: translateY(2px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Ensure smooth scrolling */
+.qa-answer::-webkit-scrollbar {
+    width: 8px;
+}
+
+.qa-answer::-webkit-scrollbar-track {
+    background: rgba(30, 41, 59, 0.3);
+    border-radius: 4px;
+}
+
+.qa-answer::-webkit-scrollbar-thumb {
+    background: #475569;
+    border-radius: 4px;
+}
+
+.qa-answer::-webkit-scrollbar-thumb:hover {
+    background: #64748b;
+}
+
+/* Typing cursor animation (optional) */
+.typing-cursor {
+    display: inline-block;
+    width: 8px;
+    height: 16px;
+    background: #3b82f6;
+    animation: blink 1s infinite;
+    margin-left: 2px;
+}
+
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+
+/* Add this to your existing styles.css file */
+
+/* ================= MERGED AI HELP LAYER WITH Q/A PANEL ================= */
+
+/* When step4 is active, apply AI Help layer theme to the entire panel */
+body.step4-active .ai-panel {
+    /* AI Help layer glass theme */
+    background: rgba(8, 12, 19, 0.38); /* Lighter glass */
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    
+    border: 1px solid rgba(148, 163, 184, 0.65);
+    box-shadow: 0 28px 80px rgba(0, 0, 0, 0.95);
+    
+    /* Text colors from AI Help layer */
+    color: #f9fafb;
+    
+    /* Font styling from AI Help */
+    font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+
+/* Q/A Card inside AI Panel - Apply AI Help styling */
+body.step4-active .qa-card {
+    /* Background gradient from AI Help */
+    background: radial-gradient(circle at 0% 0%, #1f2937 0, #020617 55%);
+    
+    /* Border and shadow from AI Help */
+    border: 1px solid rgba(148, 163, 184, 0.5);
+    box-shadow: 0 14px 30px rgba(15, 23, 42, 0.9);
+    
+    /* Text colors */
+    color: #f9fafb;
+}
+
+/* Q/A Labels - Apply AI Help yellow color */
+body.step4-active .qa-label-question,
+body.step4-active .qa-label-answer {
+    color: #fde68a !important; /* AI Help yellow */
+    font-weight: 600;
+}
+
+/* Q/A Text - Apply AI Help colors */
+body.step4-active .qa-question-text {
+    color: #f9fafb;
+}
+
+body.step4-active .qa-answer {
+    color: #f9fafb;
+}
+
+/* Control buttons - Apply AI Help styling */
+body.step4-active .control-row {
+    background: transparent;
+    border: none;
+}
+
+body.step4-active .primary-btn,
+body.step4-active .secondary-btn {
+    /* Use AI Help button styling */
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.7);
+    background: rgba(15, 23, 42, 0.95);
+    color: #f9fafb;
+    transition: all 0.2s;
+}
+
+body.step4-active .primary-btn:hover {
+    background: rgba(59, 130, 246, 0.9);
+    border-color: #3b82f6;
+}
+
+body.step4-active .secondary-btn:hover {
+    background: rgba(148, 163, 184, 0.3);
+}
+
+/* Duration label - AI Help style */
+body.step4-active .aihelp-clock {
+    color: #e5e7eb;
+    opacity: 0.8;
+    font-size: 12px;
+}
+
+/* Chat row - AI Help styling */
+body.step4-active .chat-row {
+    background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(148, 163, 184, 0.4);
+    border-radius: 12px;
+}
+
+body.step4-active .chat-input {
+    background: rgba(15, 23, 42, 0.95);
+    border: 1px solid rgba(148, 163, 184, 0.7);
+    color: #f9fafb;
+}
+
+body.step4-active .chat-input::placeholder {
+    color: #9ca3af;
+}
+
+/* Q/A Footer - AI Help style */
+body.step4-active .qa-footer {
+    color: #e5e7eb;
+    border-top: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+/* ================= SCROLL BAR STYLING ================= */
+body.step4-active .qa-answer::-webkit-scrollbar {
+    width: 8px;
+}
+
+body.step4-active .qa-answer::-webkit-scrollbar-track {
+    background: rgba(30, 41, 59, 0.3);
+    border-radius: 4px;
+}
+
+body.step4-active .qa-answer::-webkit-scrollbar-thumb {
+    background: #475569;
+    border-radius: 4px;
+}
+
+body.step4-active .qa-answer::-webkit-scrollbar-thumb:hover {
+    background: #64748b;
+}
+
+/* ================= BULLET POINTS & CODE BLOCKS ================= */
+body.step4-active .bullet-item:before {
+    color: #fde68a; /* AI Help yellow for bullets */
+}
+
+body.step4-active .chatgpt-code-block {
+    background: #0f172a;
+    border: 1px solid #334155;
+}
+
+body.step4-active .chatgpt-code-block .code-header {
+    background: #1e293b;
+    border-bottom: 1px solid #334155;
+}
+
+body.step4-active .inline-code {
+    background: rgba(30, 41, 59, 0.7);
+    border: 1px solid #475569;
+    color: #fbbf24;
+}
+
+/* ================= THINKING & ERROR STATES ================= */
+body.step4-active .thinking {
+    color: #94a3b8;
+    background: transparent;
+    border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+body.step4-active .error {
+    color: #f87171;
+    background: rgba(239, 68, 68, 0.1);
+    border-left: 3px solid #f87171;
+}
+
+/* ================= RESPONSIVE ADJUSTMENTS ================= */
+@media (max-width: 800px) {
+    body.step4-active .ai-panel {
+        width: 95vw;
+        left: 50%;
+        transform: translateX(-50%);
+    }
+    
+    body.step4-active .ai-overlay-bar {
+        width: 95vw;
+        left: 50%;
+        transform: translateX(-50%);
+    }
 }
