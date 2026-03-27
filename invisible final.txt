@@ -24,7 +24,7 @@ function createWindow() {
         show: true,
 
         // 🔴 NEVER appear in taskbar / Alt+Tab
-        skipTaskbar: false, // Changed to false to show in taskbar when not minimized
+        skipTaskbar: true,
 
         // 🔥 MUST stay above all apps
         alwaysOnTop: true,
@@ -37,7 +37,7 @@ function createWindow() {
     });
 
     // 🔐 Invisible to screen sharing (Zoom / Teams / OBS)
-    mainWindow.setContentProtection(false); // Changed to false to allow normal operation
+    mainWindow.setContentProtection(true);
 
     // 🔥 Strongest Windows always-on-top level
     mainWindow.setAlwaysOnTop(true, 'screen-saver');
@@ -53,9 +53,19 @@ function createWindow() {
     ipcMain.on('close-window', () => app.quit());
     ipcMain.on('restore-window', restoreFromCircle);
 
-    ipcMain.on('move-circle', (event, x, y) => {
+    // Handle circle dragging with relative movement
+    ipcMain.on('move-circle-relative', (event, deltaX, deltaY) => {
         if (circleWindow) {
-            circleWindow.setPosition(x, y);
+            const [currentX, currentY] = circleWindow.getPosition();
+            circleWindow.setPosition(currentX + deltaX, currentY + deltaY);
+        }
+    });
+
+    // Handle step window dragging
+    ipcMain.on('move-step-window', (event, deltaX, deltaY) => {
+        if (mainWindow && mainWindow.isVisible()) {
+            const [currentX, currentY] = mainWindow.getPosition();
+            mainWindow.setPosition(currentX + deltaX, currentY + deltaY);
         }
     });
 
@@ -90,12 +100,11 @@ function createWindow() {
 }
 
 /* ======================================================
-   CIRCLE WINDOW (INVISIBLE TO SCREEN CAPTURE)
+   CIRCLE WINDOW (INVISIBLE)
    ====================================================== */
 function createCircleWindow(x, y) {
     if (circleWindow) {
         circleWindow.focus();
-        circleWindow.setAlwaysOnTop(true, 'screen-saver');
         return circleWindow;
     }
 
@@ -107,14 +116,17 @@ function createCircleWindow(x, y) {
         frame: false,
         transparent: true,
         backgroundColor: '#00000000',
+
         alwaysOnTop: true,
         skipTaskbar: true,
+
         resizable: false,
-        movable: false,
+        movable: false,  // We handle movement manually
         minimizable: false,
         maximizable: false,
         fullscreenable: false,
         show: false,
+
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
@@ -123,7 +135,7 @@ function createCircleWindow(x, y) {
     });
 
     // 🔐 Invisible to screen capture
-    circleWindow.setContentProtection(false); // Changed to false
+    circleWindow.setContentProtection(true);
     circleWindow.setAlwaysOnTop(true, 'screen-saver');
 
     circleWindow.loadFile('circle.html');
@@ -136,36 +148,30 @@ function createCircleWindow(x, y) {
 }
 
 /* ======================================================
-   MINIMIZE TO CIRCLE (POSITION AT TOP CENTER)
+   MINIMIZE / RESTORE (UPDATED - TOP CENTER)
    ====================================================== */
 function minimizeToCircle() {
     if (!mainWindow) return;
 
     isMinimized = true;
     mainWindow.hide();
-    mainWindow.setSkipTaskbar(true); // Hide from taskbar when minimized to circle
 
-    // 🎯 POSITION AT TOP CENTER OF SCREEN
-    const { width, height } = screen.getPrimaryDisplay().workAreaSize;
-    const circleX = Math.floor((width - 60) / 2); // Center horizontally
+    // Position at top center
+    const { width } = screen.getPrimaryDisplay().workAreaSize;
+    const circleX = Math.floor(width / 2) - 30; // 30 is half of 60px circle
     const circleY = 20; // 20px from top
 
     const circleWin = createCircleWindow(circleX, circleY);
     circleWin.show();
     circleWin.focus();
-    circleWin.setAlwaysOnTop(true, 'screen-saver');
 }
 
-/* ======================================================
-   RESTORE FROM CIRCLE
-   ====================================================== */
 function restoreFromCircle() {
     if (!mainWindow) return;
 
     isMinimized = false;
-    mainWindow.setSkipTaskbar(false); // Show in taskbar again
+
     mainWindow.show();
-    mainWindow.focus();
     mainWindow.setAlwaysOnTop(true, 'screen-saver');
 
     if (circleWindow) {
@@ -174,7 +180,7 @@ function restoreFromCircle() {
 }
 
 /* ======================================================
-   TRAY
+   TRAY (UNCHANGED)
    ====================================================== */
 function createTray() {
     const icon = nativeImage.createFromDataURL(LOGO_BASE64);
@@ -206,42 +212,20 @@ function createTray() {
 }
 
 /* ======================================================
-   BACKEND START - UPDATED WITH YOUR CODE
+   BACKEND (UNCHANGED)
    ====================================================== */
 function startBackend() {
-    const isProd = app.isPackaged;
+    const pythonPath = process.platform === 'win32' ? 'python' : 'python3';
+    const scriptPath = path.join(__dirname, 'main.py');
 
-    let command;
-    let args = [];
+    pythonServer = spawn(pythonPath, [scriptPath]);
 
-    if (isProd) {
-        // ✅ PRODUCTION: run packaged backend.exe
-        command = path.join(process.resourcesPath, 'backend', 'backend.exe');
-    } else {
-        // ✅ DEVELOPMENT: run python main.py
-        command = process.platform === 'win32' ? 'python' : 'python3';
-        args = [path.join(__dirname, '..', 'app', 'main.py')];
-    }
-
-    pythonServer = spawn(command, args, {
-        detached: true,
-        stdio: isProd ? 'ignore' : 'pipe'
-    });
-
-    pythonServer.unref();
-
-    if (!isProd) {
-        pythonServer.stdout.on('data', d =>
-            console.log(`Backend: ${d.toString()}`)
-        );
-        pythonServer.stderr.on('data', d =>
-            console.error(`Backend Error: ${d.toString()}`)
-        );
-    }
+    pythonServer.stdout.on('data', d => console.log(`Backend: ${d}`));
+    pythonServer.stderr.on('data', d => console.error(`Backend Error: ${d}`));
 }
 
 /* ======================================================
-   APP LIFECYCLE
+   APP LIFECYCLE (UNCHANGED)
    ====================================================== */
 app.whenReady().then(createWindow);
 

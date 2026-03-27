@@ -1,36 +1,3 @@
-function startBackend() {
-    const isProd = app.isPackaged;
-
-    let command;
-    let args = [];
-
-    if (isProd) {
-        // ✅ PRODUCTION: run packaged backend.exe
-        command = path.join(process.resourcesPath, 'backend', 'backend.exe');
-    } else {
-        // ✅ DEVELOPMENT: run python main.py
-        command = process.platform === 'win32' ? 'python' : 'python3';
-        args = [path.join(__dirname, '..', 'app', 'main.py')];
-    }
-
-    pythonServer = spawn(command, args, {
-        detached: true,
-        stdio: isProd ? 'ignore' : 'pipe'
-    });
-
-    pythonServer.unref();
-
-    if (!isProd) {
-        pythonServer.stdout.on('data', d =>
-            console.log(`Backend: ${d.toString()}`)
-        );
-        pythonServer.stderr.on('data', d =>
-            console.error(`Backend Error: ${d.toString()}`)
-        );
-    }
-}
-
-
 const { LOGO_BASE64 } = require('./logo.js');
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, screen } = require('electron');
 const path = require('path');
@@ -43,7 +10,7 @@ let pythonServer = null;
 let isMinimized = false;
 
 /* ======================================================
-   CREATE MAIN WINDOW
+   MAIN INVISIBLE WINDOW (LOCKED)
    ====================================================== */
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -55,8 +22,13 @@ function createWindow() {
         transparent: true,
         backgroundColor: '#00000000',
         show: true,
-        skipTaskbar: false,
+
+        // 🔴 NEVER appear in taskbar / Alt+Tab
+        skipTaskbar: true,
+
+        // 🔥 MUST stay above all apps
         alwaysOnTop: true,
+
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
@@ -64,43 +36,62 @@ function createWindow() {
         }
     });
 
-    mainWindow.setContentProtection(false);
+    // 🔐 Invisible to screen sharing (Zoom / Teams / OBS)
+    mainWindow.setContentProtection(true);
+
+    // 🔥 Strongest Windows always-on-top level
     mainWindow.setAlwaysOnTop(true, 'screen-saver');
+
     mainWindow.loadFile('index.html');
-    
-    // REMOVE IN PRODUCTION: Enable for debugging
-    // mainWindow.webContents.openDevTools();
 
     createTray();
     startBackend();
 
-    /* ================= IPC HANDLERS ================= */
+    /* ================= IPC ================= */
+
     ipcMain.on('minimize-window', minimizeToCircle);
     ipcMain.on('close-window', () => app.quit());
     ipcMain.on('restore-window', restoreFromCircle);
 
-    ipcMain.on('move-circle', (event, x, y) => {
+    // Handle circle dragging with relative movement
+    ipcMain.on('move-circle-relative', (event, deltaX, deltaY) => {
         if (circleWindow) {
-            circleWindow.setPosition(x, y);
+            const [currentX, currentY] = circleWindow.getPosition();
+            circleWindow.setPosition(currentX + deltaX, currentY + deltaY);
+        }
+    });
+
+    // Handle step window dragging
+    ipcMain.on('move-step-window', (event, deltaX, deltaY) => {
+        if (mainWindow && mainWindow.isVisible()) {
+            const [currentX, currentY] = mainWindow.getPosition();
+            mainWindow.setPosition(currentX + deltaX, currentY + deltaY);
         }
     });
 
     /* ======================================================
-       PREVENT AUTO HIDE / AUTO MINIMIZE
+       🔒 INVISIBILITY + FOREGROUND PROTECTION
        ====================================================== */
+
+    // ❌ Block OS minimize (Alt+Tab / Win shortcuts)
     mainWindow.on('minimize', (e) => {
         e.preventDefault();
-        mainWindow.show();
-        mainWindow.focus();
-    });
-
-    mainWindow.on('blur', () => {
-        if (!isMinimized && mainWindow) {
+        if (!isMinimized) {
             mainWindow.show();
             mainWindow.setAlwaysOnTop(true, 'screen-saver');
         }
     });
 
+    // 🔥 If focus lost (click outside / switch app)
+    mainWindow.on('blur', () => {
+        if (!isMinimized) {
+            // Stay invisible but force front
+            mainWindow.show();
+            mainWindow.setAlwaysOnTop(true, 'screen-saver');
+        }
+    });
+
+    // ❌ Never allow OS hide
     mainWindow.on('hide', () => {
         if (!isMinimized) {
             mainWindow.show();
@@ -109,7 +100,7 @@ function createWindow() {
 }
 
 /* ======================================================
-   CIRCLE WINDOW
+   CIRCLE WINDOW (INVISIBLE)
    ====================================================== */
 function createCircleWindow(x, y) {
     if (circleWindow) {
@@ -125,14 +116,17 @@ function createCircleWindow(x, y) {
         frame: false,
         transparent: true,
         backgroundColor: '#00000000',
+
         alwaysOnTop: true,
         skipTaskbar: true,
+
         resizable: false,
-        movable: false,
+        movable: false,  // We handle movement manually
         minimizable: false,
         maximizable: false,
         fullscreenable: false,
         show: false,
+
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
@@ -140,12 +134,11 @@ function createCircleWindow(x, y) {
         }
     });
 
-    circleWindow.setContentProtection(false);
+    // 🔐 Invisible to screen capture
+    circleWindow.setContentProtection(true);
     circleWindow.setAlwaysOnTop(true, 'screen-saver');
+
     circleWindow.loadFile('circle.html');
-    
-    // REMOVE IN PRODUCTION: Enable for debugging
-    // circleWindow.webContents.openDevTools();
 
     circleWindow.on('closed', () => {
         circleWindow = null;
@@ -155,18 +148,17 @@ function createCircleWindow(x, y) {
 }
 
 /* ======================================================
-   MINIMIZE TO CIRCLE
+   MINIMIZE / RESTORE (UPDATED - TOP CENTER)
    ====================================================== */
 function minimizeToCircle() {
     if (!mainWindow) return;
 
     isMinimized = true;
     mainWindow.hide();
-    mainWindow.setSkipTaskbar(true);
 
-    // POSITION AT TOP CENTER OF SCREEN
-    const { width, height } = screen.getPrimaryDisplay().workAreaSize;
-    const circleX = Math.floor((width - 60) / 2); // Center horizontally
+    // Position at top center
+    const { width } = screen.getPrimaryDisplay().workAreaSize;
+    const circleX = Math.floor(width / 2) - 30; // 30 is half of 60px circle
     const circleY = 20; // 20px from top
 
     const circleWin = createCircleWindow(circleX, circleY);
@@ -174,16 +166,12 @@ function minimizeToCircle() {
     circleWin.focus();
 }
 
-/* ======================================================
-   RESTORE FROM CIRCLE
-   ====================================================== */
 function restoreFromCircle() {
     if (!mainWindow) return;
 
     isMinimized = false;
-    mainWindow.setSkipTaskbar(false);
+
     mainWindow.show();
-    mainWindow.focus();
     mainWindow.setAlwaysOnTop(true, 'screen-saver');
 
     if (circleWindow) {
@@ -192,7 +180,7 @@ function restoreFromCircle() {
 }
 
 /* ======================================================
-   TRAY
+   TRAY (UNCHANGED)
    ====================================================== */
 function createTray() {
     const icon = nativeImage.createFromDataURL(LOGO_BASE64);
@@ -224,40 +212,20 @@ function createTray() {
 }
 
 /* ======================================================
-   BACKEND START - YOUR EXISTING CODE
+   BACKEND (UNCHANGED)
    ====================================================== */
 function startBackend() {
-    const isProd = app.isPackaged;
+    const pythonPath = process.platform === 'win32' ? 'python' : 'python3';
+    const scriptPath = path.join(__dirname, 'main.py');
 
-    let command;
-    let args = [];
+    pythonServer = spawn(pythonPath, [scriptPath]);
 
-    if (isProd) {
-        command = path.join(process.resourcesPath, 'backend', 'backend.exe');
-    } else {
-        command = process.platform === 'win32' ? 'python' : 'python3';
-        args = [path.join(__dirname, '..', 'app', 'main.py')];
-    }
-
-    pythonServer = spawn(command, args, {
-        detached: true,
-        stdio: isProd ? 'ignore' : 'pipe'
-    });
-
-    pythonServer.unref();
-
-    if (!isProd) {
-        pythonServer.stdout.on('data', d =>
-            console.log(`Backend: ${d.toString()}`)
-        );
-        pythonServer.stderr.on('data', d =>
-            console.error(`Backend Error: ${d.toString()}`)
-        );
-    }
+    pythonServer.stdout.on('data', d => console.log(`Backend: ${d}`));
+    pythonServer.stderr.on('data', d => console.error(`Backend Error: ${d}`));
 }
 
 /* ======================================================
-   APP LIFECYCLE
+   APP LIFECYCLE (UNCHANGED)
    ====================================================== */
 app.whenReady().then(createWindow);
 

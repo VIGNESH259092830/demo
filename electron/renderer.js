@@ -1,33 +1,6 @@
-function setupWindowControls() {
-    // Minimize button
-    const btnMin = document.getElementById('btnMin');
-    if (btnMin) {
-        btnMin.addEventListener('click', (e) => {
-            e.preventDefault();
-            console.log('🔘 Minimize button clicked');
-            
-            if (window.electronAPI && window.electronAPI.minimizeWindow) {
-                window.electronAPI.minimizeWindow();
-            }
-        });
-    }
-    
-    // Close button
-    const btnClose = document.getElementById('btnClose');
-    if (btnClose) {
-        btnClose.addEventListener('click', (e) => {
-            e.preventDefault();
-            console.log('🔘 Close button clicked');
-            
-            if (window.electronAPI && window.electronAPI.closeWindow) {
-                window.electronAPI.closeWindow();
-            }
-        });
-    }
+// renderer.js - COMPLETE FIXED VERSION - ONLY fetch handles AI streams
+// 🔥 CRITICAL FIX: SSE only handles transcripts, NO AI events in SSE
 
-}
-// renderer.js - COMPLETE WORKING VERSION WITH DUPLICATE PREVENTION
-// render.js - COMPLETE WORKING VERSION WITH ALL FIXES
 document.addEventListener("DOMContentLoaded", function() {
     console.log("🚀 Interview Helper Frontend Initializing...");
     
@@ -44,6 +17,10 @@ document.addEventListener("DOMContentLoaded", function() {
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 10;
     
+    // 🔥 NEW: Overlay position for <> key movement
+    let overlayPosition = 0;
+    const OVERLAY_MOVE_STEP = 20;
+    
     // Duplicate prevention tracking
     let lastProcessedText = "";
     let lastProcessedTime = 0;
@@ -54,7 +31,12 @@ document.addEventListener("DOMContentLoaded", function() {
     // Scroll management
     let isAutoScrollEnabled = false;
     let lastUserScrollTime = Date.now();
-    const AUTO_SCROLL_THRESHOLD = 2000; // 2 seconds
+    const AUTO_SCROLL_THRESHOLD = 2000;
+    
+    // ================= DRAG ANYWHERE =================
+    let isDragging = false;
+    let dragStartX = 0;
+    let dragStartY = 0;
     
     // ================= ELEMENTS =================
     const qaQuestion = document.getElementById("qaQuestion");
@@ -90,30 +72,180 @@ document.addEventListener("DOMContentLoaded", function() {
     const sessionMeta = document.getElementById("sessionMeta");
     const sessionMessages = document.getElementById("sessionMessages");
     
-    // ================= STATUS UPDATES =================
+    // Window elements for dragging
+    const windowShell = document.getElementById("windowShell");
+    const aiToolbar = document.getElementById("aiToolbar");
+    const aiPanel = document.getElementById("aiPanel");
+
+    // ================= 🔥 CURSOR CONTROL - NO HAND SYMBOLS =================
+    function setupCursorControl() {
+        console.log("🖱️ Setting up cursor control - NO HAND SYMBOLS");
+        
+        const cursorStyle = document.createElement('style');
+        cursorStyle.id = 'cursor-control-style';
+        cursorStyle.textContent = `
+            /* ===== ARROW CURSOR FOR EVERYTHING - NO HAND SYMBOLS ===== */
+            * {
+                cursor: default !important;
+            }
+            
+            button, .tab, .ctrl, .circle-icon, .square-icon, .pill, 
+            .nav-btn, .primary-btn, .secondary-btn, a, .session-item,
+            .clickable, [role="button"], [type="button"], [type="submit"],
+            [type="reset"], .copy-button, .copy-code-btn, #toolbarChat,
+            #chatSend, .window-control, .btn, .icon-button, .menu-item,
+            .dropdown-item, .select-item, .option, .close-btn, .min-btn {
+                cursor: default !important;
+            }
+            
+            button:disabled, .ctrl:disabled, .pill:disabled,
+            .nav-btn:disabled, .primary-btn:disabled {
+                cursor: not-allowed !important;
+            }
+            
+            input, textarea, .chat-input, [type="text"], [type="email"], 
+            [type="password"], [contenteditable="true"], .editable {
+                cursor: text !important;
+            }
+            
+            /* ===== SCREEN SHARING - HIDE CURSOR COMPLETELY ===== */
+            body.screen-sharing, body.screen-sharing * {
+                cursor: none !important;
+            }
+            
+            body.screen-sharing {
+                caret-color: transparent;
+            }
+            
+            .drag-region, .window-header, #windowShell, #aiToolbar, 
+            .ai-panel-header, [data-drag-region="true"] {
+                -webkit-app-region: drag;
+            }
+            
+            .no-drag, button, input, textarea, select, a {
+                -webkit-app-region: no-drag;
+            }
+            
+            body.dragging, body.dragging * {
+                cursor: grabbing !important;
+            }
+        `;
+        
+        const existingStyle = document.getElementById('cursor-control-style');
+        if (existingStyle) existingStyle.remove();
+        document.head.appendChild(cursorStyle);
+        
+        function detectScreenShare() {
+            const isScreenSharing = 
+                document.querySelector('video[src*="screen"]') !== null ||
+                document.querySelector('video[src*="display"]') !== null ||
+                document.querySelector('div[class*="screen-share"]') !== null ||
+                document.querySelector('div[class*="presenting"]') !== null ||
+                document.querySelector('div[class*="desktop-capture"]') !== null ||
+                document.body.classList.contains('screen-share-active') ||
+                document.querySelector('div[aria-label*="screen" i]') !== null ||
+                document.querySelector('div[aria-label*="present" i]') !== null;
+            
+            if (isScreenSharing) {
+                document.body.classList.add('screen-sharing');
+                console.log("📺 Screen sharing detected - cursor hidden");
+            } else {
+                document.body.classList.remove('screen-sharing');
+            }
+        }
+        
+        setInterval(detectScreenShare, 1000);
+        detectScreenShare();
+        
+        if (navigator.mediaDevices) {
+            navigator.mediaDevices.addEventListener('devicechange', detectScreenShare);
+        }
+        
+        console.log("✅ Cursor control active - NO HAND SYMBOLS, cursor hidden during screen share");
+    }
+
+    // ================= 🔥 OVERLAY MOVEMENT WITH <> KEYS =================
+    function setupOverlayMovement() {
+        console.log("🔄 Setting up overlay movement with < > keys...");
+        
+        const overlayElements = [aiToolbar, aiPanel].filter(el => el !== null);
+        
+        if (overlayElements.length === 0) {
+            console.log("⚠️ No overlay elements found for <> key movement");
+            return;
+        }
+        
+        console.log(`✅ Found ${overlayElements.length} overlay elements for <> movement`);
+        
+        overlayPosition = 0;
+        
+        document.removeEventListener('keydown', handleBracketKeys);
+        document.addEventListener('keydown', handleBracketKeys);
+        
+        function handleBracketKeys(event) {
+            const activeElement = document.activeElement;
+            const isInputFocused = activeElement.tagName === 'INPUT' || 
+                                 activeElement.tagName === 'TEXTAREA' ||
+                                 activeElement.isContentEditable;
+            
+            if (isInputFocused) {
+                return;
+            }
+            
+            // 🔥 < key = move left, > key = move right (Shift + , or Shift + .)
+            if (event.key === ',' && event.shiftKey && !event.ctrlKey && !event.altKey) {
+                event.preventDefault();
+                overlayPosition -= OVERLAY_MOVE_STEP;
+                console.log(`⬅️ < key pressed - Moving overlay LEFT: ${overlayPosition}px`);
+                
+                overlayElements.forEach(el => {
+                    if (el) {
+                        el.style.transform = `translateX(${overlayPosition}px)`;
+                        el.style.transition = 'transform 0.1s ease-out';
+                    }
+                });
+            }
+            
+            if (event.key === '.' && event.shiftKey && !event.ctrlKey && !event.altKey) {
+                event.preventDefault();
+                overlayPosition += OVERLAY_MOVE_STEP;
+                console.log(`➡️ > key pressed - Moving overlay RIGHT: ${overlayPosition}px`);
+                
+                overlayElements.forEach(el => {
+                    if (el) {
+                        el.style.transform = `translateX(${overlayPosition}px)`;
+                        el.style.transition = 'transform 0.1s ease-out';
+                    }
+                });
+            }
+        }
+        
+        console.log("✅ Overlay movement ready - < moves LEFT, > moves RIGHT");
+    }
+
+    // ================= STATUS UPDATES - NO ALERT TAB =================
     function updateAudioStatus() {
-        // Update button states
         if (btnMic) {
             btnMic.classList.toggle("is-on", !micMuted);
             btnMic.classList.toggle("is-off", micMuted);
-            btnMic.title = micMuted ? "Mic OFF (backend running)" : "Mic ON";
+            btnMic.title = micMuted ? "Microphone OFF - Click to unmute" : "Microphone ON - Click to mute";
         }
         
         if (btnSystem) {
             btnSystem.classList.toggle("is-on", !systemMuted);
             btnSystem.classList.toggle("is-off", systemMuted);
-            btnSystem.title = systemMuted ? "System OFF (backend running)" : "System ON";
+            btnSystem.title = systemMuted ? "System Audio OFF - Click to unmute" : "System Audio ON - Click to mute";
         }
         
-        // Update toolbar status
         const micStatus = micMuted ? "OFF" : "ON";
         const sysStatus = systemMuted ? "OFF" : "ON";
+        const micIcon = micMuted ? "🔇" : "🎤";
+        const sysIcon = systemMuted ? "🔇" : "💻";
         
         if (toolbarDuration) {
-            toolbarDuration.textContent = `🎤 ${micStatus} | 💻 ${sysStatus}`;
+            toolbarDuration.textContent = `${micIcon} ${micStatus} | ${sysIcon} ${sysStatus}`;
         }
         
-        // Update Q/A panel indicators
         updateQAPanelIndicators(micMuted, systemMuted);
     }
     
@@ -148,6 +280,64 @@ document.addEventListener("DOMContentLoaded", function() {
         }
     }
     
+    // ================= DRAG ANYWHERE FUNCTIONALITY =================
+    function setupDragAnywhere() {
+        console.log("🖱️ Setting up drag anywhere functionality...");
+        
+        if (document.querySelector('.circle-container')) {
+            console.log("⭕ Circle window detected - skipping main window drag");
+            return;
+        }
+        
+        if (windowShell) {
+            windowShell.removeEventListener('mousedown', startDrag);
+            windowShell.addEventListener('mousedown', startDrag);
+        }
+        
+        if (aiToolbar) {
+            aiToolbar.removeEventListener('mousedown', startDrag);
+            aiToolbar.addEventListener('mousedown', startDrag);
+        }
+        
+        const aiPanelHeader = document.querySelector('.ai-panel-header');
+        if (aiPanelHeader) {
+            aiPanelHeader.removeEventListener('mousedown', startDrag);
+            aiPanelHeader.addEventListener('mousedown', startDrag);
+        }
+        
+        document.removeEventListener('mousemove', onDrag);
+        document.removeEventListener('mouseup', stopDrag);
+        document.addEventListener('mousemove', onDrag);
+        document.addEventListener('mouseup', stopDrag);
+        
+        console.log("✅ Drag anywhere setup complete");
+    }
+    
+    function startDrag(e) {
+        if (e.target.tagName === 'BUTTON' || 
+            e.target.tagName === 'INPUT' || 
+            e.target.tagName === 'TEXTAREA' ||
+            e.target.classList.contains('no-drag') ||
+            e.target.closest('button')) {
+            return;
+        }
+        
+        isDragging = true;
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        document.body.classList.add('dragging');
+    }
+    
+    function onDrag(e) {
+        if (!isDragging) return;
+        e.preventDefault();
+    }
+    
+    function stopDrag() {
+        isDragging = false;
+        document.body.classList.remove('dragging');
+    }
+    
     // ================= SESSION TIMER =================
     function startSessionTimer() {
         if (sessionTimer) clearInterval(sessionTimer);
@@ -179,7 +369,9 @@ document.addEventListener("DOMContentLoaded", function() {
         if (toolbarDuration) {
             const micStatus = micMuted ? "OFF" : "ON";
             const sysStatus = systemMuted ? "OFF" : "ON";
-            toolbarDuration.textContent = `🎤 ${micStatus} | 💻 ${sysStatus} | ⏱️ ${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            const micIcon = micMuted ? "🔇" : "🎤";
+            const sysIcon = systemMuted ? "🔇" : "💻";
+            toolbarDuration.textContent = `${micIcon} ${micStatus} | ${sysIcon} ${sysStatus} | ⏱️ ${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
         }
     }
     
@@ -220,100 +412,79 @@ document.addEventListener("DOMContentLoaded", function() {
         return false;
     }
     
-    // ================= SSE CONNECTION =================
-    function connectSSE() {
-        if (sseConnection) {
-            console.log("🔄 Closing existing SSE connection");
-            sseConnection.close();
-            sseConnection = null;
-        }
-        
-        console.log("🔄 Connecting to SSE stream...");
-        
-        try {
-            sseConnection = new EventSource("http://127.0.0.1:8000/stream");
-            
-            sseConnection.onopen = () => {
-                console.log("✅ SSE connection established");
-                reconnectAttempts = 0;
-            };
-            
-            sseConnection.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    
-                    if (data.type === "transcript") {
-                        handleTranscript(data);
-                    } else if (data.type === "ai_start") {
-                        console.log("🤖 AI started generating...");
-                        qaAnswer.innerHTML = '<div class="thinking">AI is generating answer...</div>';
-                        // 🔥 FIX 3: Keep scroll at top
-                        qaAnswer.scrollTop = 0;
-                    } else if (data.type === "ai_stream") {
-                        console.log("⚡ AI stream content:", data.content);
-                        
-                        if (qaAnswer.innerHTML.includes('thinking')) {
-                            qaAnswer.innerHTML = data.content;
-                            // 🔥 FIX 3: Stay at top
-                            qaAnswer.scrollTop = 0;
-                        } else {
-                            qaAnswer.innerHTML += data.content;
-                        }
-                    } else if (data.type === "ai_complete") {
-                        console.log("✅ AI response complete");
-                        isAiResponding = false;
-                        btnAnswer.disabled = false;
-                        
-                        if (data.content) {
-                            qaAnswer.innerHTML = data.content;
-                        }
-                        
-                        // Reset for next question
-                        setTimeout(() => {
-                            qaQuestion.textContent = "Listening for next question...";
-                            qaQuestion.classList.remove("partial-text");
-                            currentTranscript = "";
-                            lastProcessedText = "";
-                            lastPartialText = "";
-                            lastFinalText = "";
-                            duplicateBlockList.clear();
-                        }, 500);
-                    } else if (data.type === "ai_error") {
-                        console.error("❌ AI error:", data.error);
-                        qaAnswer.innerHTML = `<div class="error">AI Error: ${data.error}</div>`;
-                        isAiResponding = false;
-                        btnAnswer.disabled = false;
-                    }
-                } catch (error) {
-                    console.error("❌ SSE parse error:", error);
-                }
-            };
-            
-            sseConnection.onerror = (error) => {
-                console.error("❌ SSE connection error:", error);
-                
-                if (sseConnection) {
-                    sseConnection.close();
-                    sseConnection = null;
-                }
-                
-                reconnectAttempts++;
-                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-                    console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-                    setTimeout(connectSSE, 1000);
-                } else {
-                    console.error("❌ Max reconnection attempts reached");
-                    if (qaQuestion) {
-                        qaQuestion.textContent = "Connection lost. Please refresh.";
-                    }
-                }
-            };
-            
-        } catch (error) {
-            console.error("❌ Failed to create SSE connection:", error);
-            setTimeout(connectSSE, 1000);
-        }
+   // ================= 🔥 FIXED SSE CONNECTION - HANDLES AI STATUS =================
+function connectSSE() {
+    if (sseConnection) {
+        console.log("🔄 Closing existing SSE connection");
+        sseConnection.close();
+        sseConnection = null;
     }
+    
+    console.log("🔄 Connecting to SSE stream...");
+    
+    try {
+        sseConnection = new EventSource("http://127.0.0.1:8000/stream");
+        
+        sseConnection.onopen = () => {
+            console.log("✅ SSE connection established");
+            reconnectAttempts = 0;
+        };
+        
+        sseConnection.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                
+                // 🔥 Handle AI status updates
+                if (data.type === "ai_status") {
+                    console.log(`🤖 AI status: ${data.is_responding ? 'responding' : 'idle'}`);
+                    if (data.is_responding) {
+                        qaQuestion.textContent = "AI is answering...";
+                    }
+                    return;
+                }
+                
+                // Handle transcript events
+                if (data.type === "transcript") {
+                    // If AI is responding and this is a transcript, show in question area
+                    if (data.ai_responding) {
+                        if (data.text) {
+                            qaQuestion.textContent = data.text;
+                        }
+                    } else {
+                        handleTranscript(data);
+                    }
+                }
+                
+            } catch (error) {
+                console.error("❌ SSE parse error:", error);
+            }
+        };
+        
+        sseConnection.onerror = (error) => {
+            console.error("❌ SSE connection error:", error);
+            
+            if (sseConnection) {
+                sseConnection.close();
+                sseConnection = null;
+            }
+            
+            reconnectAttempts++;
+            if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+                console.log(`🔄 Reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+                setTimeout(connectSSE, 1000);
+            } else {
+                console.error("❌ Max reconnection attempts reached");
+                if (qaQuestion) {
+                    qaQuestion.textContent = "Connection lost. Please refresh.";
+                }
+            }
+        };
+        
+    } catch (error) {
+        console.error("❌ Failed to create SSE connection:", error);
+        setTimeout(connectSSE, 1000);
+    }
+}
     
     // ================= TRANSCRIPT HANDLING =================
     function handleTranscript(data) {
@@ -341,7 +512,7 @@ document.addEventListener("DOMContentLoaded", function() {
         }
         if (data.source === "system" && systemMuted) {
             console.log("🔇 System muted in UI - ignoring");
-            return;
+            return; 
         }
         
         if (data.is_final) {
@@ -477,7 +648,7 @@ document.addEventListener("DOMContentLoaded", function() {
         }
     }
     
-    // ================= TOGGLE BUTTONS =================
+    // ================= TOGGLE BUTTONS - NO ALERTS =================
     async function toggleMic() {
         console.log("🎤 Toggling microphone...");
         
@@ -552,119 +723,613 @@ document.addEventListener("DOMContentLoaded", function() {
         }
     }
     
-    // ================= ANSWER BUTTON =================
-    async function handleAnswerButton() {
-        // 🔥 FIX 1: Show alert in application, not separate tab
-        if (!currentTranscript.trim()) {
-            console.log("⚠️ No transcript to answer");
-            showInAppAlert("Please speak or type a question first");
-            return;
+ // ================= 🔥 ULTRA-FAST ANSWER BUTTON - FORCE IMMEDIATE RENDERING =================
+async function handleAnswerButton() {
+    if (!currentTranscript.trim()) {
+        console.log("⚠️ No transcript to answer");
+        showInAppAlert("Please speak or type a question first");
+        return;
+    }
+    
+    if (isAiResponding) {
+        console.log("⚠️ AI is already responding");
+        return;
+    }
+    
+    const question = currentTranscript.trim();
+    console.log(`🤖 Answering FRESH question: "${question}"`);
+    
+    isAiResponding = true;
+    btnAnswer.disabled = true;
+    
+    const questionToSend = question;
+    
+    // Clear transcript immediately
+    currentTranscript = "";
+    lastProcessedText = "";
+    lastPartialText = "";
+    lastFinalText = "";
+    duplicateBlockList.clear();
+    
+    qaQuestion.textContent = "AI is answering...";
+    qaQuestion.classList.remove("partial-text");
+    
+    // 🔥 CRITICAL: Clear and prepare for streaming
+    qaAnswer.innerHTML = '<div class="thinking">Preparing answer...</div>';
+    qaAnswer.scrollTop = 0;
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    
+    try {
+        const response = await fetch("http://127.0.0.1:8000/api/answer-stream-fast", {
+            method: "POST",
+            headers: { 
+                "Content-Type": "application/json",
+                "Connection": "keep-alive",
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache"
+            },
+            body: JSON.stringify({ text: questionToSend }),
+            signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
         }
         
-        if (isAiResponding) {
-            console.log("⚠️ AI is already responding");
-            return;
-        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let rawAccumulatedText = ""; // Store raw text for formatting
+        let aiResponseComplete = false;
+        let firstTokenReceived = false;
+        let firstRealTokenReceived = false;
+        const startTime = Date.now();
         
-        const question = currentTranscript.trim();
-        console.log(`🤖 Answering FRESH question: "${question}"`);
+        // 🔥 Create a container for streaming content
+        let accumulatedHtml = '';
         
-        isAiResponding = true;
-        btnAnswer.disabled = true;
-        
-        const questionToSend = question;
-        
-        currentTranscript = "";
-        lastProcessedText = "";
-        lastPartialText = "";
-        lastFinalText = "";
-        duplicateBlockList.clear();
-        
-        qaQuestion.textContent = "Processing question...";
-        qaQuestion.classList.remove("partial-text");
-        
-        qaAnswer.innerHTML = '<div class="thinking">AI is generating interview answer...</div>';
-        // 🔥 FIX 3: Start at top
-        qaAnswer.scrollTop = 0;
-        
-        try {
-            const response = await fetch("http://127.0.0.1:8000/api/answer-stream-fast", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: questionToSend })
-            });
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
             
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
-            }
+            buffer += decoder.decode(value, { stream: true });
             
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = "";
-            let aiResponseComplete = false;
+            // 🔥 Split by double newline for SSE format
+            const lines = buffer.split('\n\n');
+            buffer = lines.pop() || "";
             
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split('\n');
-                buffer = lines.pop() || "";
-                
-                for (const line of lines) {
-                    if (line.startsWith('data: ')) {
-                        try {
-                            const data = JSON.parse(line.slice(6));
-                            
-                            if (data.type === 'ai_start') {
-                                console.log("🤖 AI started generating...");
-                            }
-                            else if (data.type === 'ai_stream') {
-                                if (qaAnswer.innerHTML.includes('thinking')) {
-                                    qaAnswer.innerHTML = data.content;
-                                    qaAnswer.scrollTop = 0; // Stay at top
-                                } else {
-                                    qaAnswer.innerHTML += data.content;
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const jsonStr = line.slice(6);
+                        const data = JSON.parse(jsonStr);
+                        
+                        if (data.type === 'ai_stream') {
+                            // Handle empty token (UI unfreezer)
+                            if (data.content === ' ') {
+                                if (!firstTokenReceived) {
+                                    console.log(`⚡ UI UNFROZEN in ${Date.now() - startTime}ms`);
+                                    firstTokenReceived = true;
                                 }
+                                continue;
                             }
-                            else if (data.type === 'ai_complete') {
-                                console.log("✅ AI response complete");
-                                isAiResponding = false;
-                                btnAnswer.disabled = false;
-                                qaAnswer.innerHTML = data.content;
-                                aiResponseComplete = true;
+                            
+                            // 🔥 Handle first real token
+                            if (!firstRealTokenReceived) {
+                                firstRealTokenReceived = true;
+                                const elapsed = Date.now() - startTime;
+                                console.log(`⚡ FIRST REAL TOKEN: ${elapsed}ms ${elapsed <= 2000 ? '✅' : '❌'}`);
                                 
-                                lastProcessedText = "";
-                                lastPartialText = "";
-                                lastFinalText = "";
-                                duplicateBlockList.clear();
+                                // Start accumulating raw text
+                                rawAccumulatedText = data.content;
+                            } else {
+                                // Append to raw text
+                                rawAccumulatedText += data.content;
                             }
-                            else if (data.type === 'ai_error') {
-                                throw new Error(data.error);
+                            
+                            // 🔥 FORMAT PROGRESSIVELY - Apply bullet point formatting to current text
+                            accumulatedHtml = formatAIResponseProgressively(rawAccumulatedText);
+                            qaAnswer.innerHTML = accumulatedHtml;
+                            
+                            // 🔥 FORCE MULTIPLE REPAINT STRATEGIES
+                            
+                            // Strategy 1: Force reflow
+                            void qaAnswer.offsetHeight;
+                            
+                            // Strategy 2: Force style recalculation
+                            window.getComputedStyle(qaAnswer).backgroundColor;
+                            
+                            // Strategy 3: Use requestAnimationFrame for next paint
+                            requestAnimationFrame(() => {
+                                // This forces a new frame
+                            });
+                            
+                            // Strategy 4: Tiny timeout to break out of microtask queue
+                            setTimeout(() => {}, 0);
+                            
+                            // Auto-scroll if enabled
+                            if (isAutoScrollEnabled) {
+                                qaAnswer.scrollTop = qaAnswer.scrollHeight;
                             }
-                        } catch (parseError) {
-                            console.warn("⚠️ Could not parse SSE data:", parseError);
+                            
+                            // Debug log every few tokens
+                            if (rawAccumulatedText.length % 50 < 10) {
+                                console.log(`📝 Token received at ${Date.now() - startTime}ms, length: ${rawAccumulatedText.length}`);
+                            }
                         }
+                        else if (data.type === 'ai_complete') {
+                            const totalTime = Date.now() - startTime;
+                            console.log(`✅ AI response complete in ${totalTime}ms`);
+                            
+                            isAiResponding = false;
+                            btnAnswer.disabled = false;
+                            
+                            // Use the formatted version from the server for final display
+                            if (data.content) {
+                                qaAnswer.innerHTML = data.content;
+                            } else {
+                                // Fallback to our progressive formatting
+                                qaAnswer.innerHTML = accumulatedHtml;
+                            }
+                            
+                            aiResponseComplete = true;
+                            
+                            // Reset for next question
+                            setTimeout(() => {
+                                qaQuestion.textContent = "Listening for next question...";
+                                qaQuestion.classList.remove("partial-text");
+                            }, 500);
+                        }
+                        else if (data.type === 'ai_error') {
+                            throw new Error(data.error);
+                        }
+                    } catch (parseError) {
+                        console.warn("⚠️ Could not parse:", parseError, "Line:", line.substring(0, 50));
                     }
                 }
             }
-            
-            if (!aiResponseComplete) {
-                isAiResponding = false;
-                btnAnswer.disabled = false;
-            }
-            
-        } catch (error) {
-            console.error("❌ AI streaming failed:", error);
-            qaAnswer.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+        }
+        
+        if (!aiResponseComplete) {
             isAiResponding = false;
             btnAnswer.disabled = false;
         }
+        
+    } catch (error) {
+        clearTimeout(timeoutId);
+        console.error("❌ AI streaming failed:", error);
+        
+        if (error.name === 'AbortError') {
+            qaAnswer.innerHTML = '<div class="error">Request timed out. Please try again.</div>';
+        } else {
+            qaAnswer.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+        }
+        
+        isAiResponding = false;
+        btnAnswer.disabled = false;
+    }
+}
+
+function formatAIResponseProgressively(text) {
+    if (!text || text.trim() === '') {
+        return '<div class="thinking">Receiving answer...</div>';
     }
     
-    // ================= CLEAR BUTTON =================
+    // Split into lines for processing
+    const lines = text.split('\n');
+    let formattedHtml = '';
+    let inBulletList = false;
+    let inNumberedList = false;
+    let inCodeBlock = false;
+    let codeBlockLines = [];
+    let codeLanguage = '';
+    
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trimRight();
+        
+        // Check for code block start/end
+        if (line.trim().startsWith('```')) {
+            if (!inCodeBlock) {
+                // Start of code block
+                inCodeBlock = true;
+                codeLanguage = line.trim().substring(3).trim() || 'java';
+                codeBlockLines = [];
+                
+                // Close any open lists
+                if (inBulletList) {
+                    formattedHtml += '</div>';
+                    inBulletList = false;
+                }
+                if (inNumberedList) {
+                    formattedHtml += '</div>';
+                    inNumberedList = false;
+                }
+            } else {
+                // End of code block
+                inCodeBlock = false;
+                const codeContent = codeBlockLines.join('\n');
+                formattedHtml += `
+                <div class="code-block">
+                    <div class="code-header">
+                        <span class="code-language">${escapeHtml(codeLanguage)}</span>
+                        <button class="copy-code-btn">Copy</button>
+                    </div>
+                    <pre><code>${escapeHtml(codeContent)}</code></pre>
+                </div>
+                `;
+            }
+            continue;
+        }
+        
+        // Inside code block - collect lines
+        if (inCodeBlock) {
+            codeBlockLines.push(line);
+            continue;
+        }
+        
+        // Skip empty lines but add spacing
+        if (line.trim() === '') {
+            if (inBulletList) {
+                formattedHtml += '</div>';
+                inBulletList = false;
+            }
+            if (inNumberedList) {
+                formattedHtml += '</div>';
+                inNumberedList = false;
+            }
+            formattedHtml += '<div class="paragraph-spacer" style="height: 12px;"></div>';
+            continue;
+        }
+        
+        // Check for numbered section headers (like "1. Short & Simple Original Theory")
+        const numberedHeaderMatch = line.match(/^(\d+)\.\s+(.+)/);
+        if (numberedHeaderMatch && line.length < 60) { // Headers are usually short
+            if (inBulletList) {
+                formattedHtml += '</div>';
+                inBulletList = false;
+            }
+            if (inNumberedList) {
+                formattedHtml += '</div>';
+                inNumberedList = false;
+            }
+            
+            const number = numberedHeaderMatch[1];
+            const headerText = numberedHeaderMatch[2];
+            
+            formattedHtml += `
+                <div class="section-header" style="
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: #3b82f6;
+                    margin: 20px 0 12px 0;
+                    padding-bottom: 4px;
+                    border-bottom: 1px solid rgba(59, 130, 246, 0.3);
+                ">
+                    <span style="
+                        display: inline-block;
+                        background: #3b82f6;
+                        color: white;
+                        border-radius: 4px;
+                        padding: 2px 8px;
+                        margin-right: 8px;
+                        font-size: 14px;
+                    ">${number}</span>
+                    ${escapeHtml(headerText)}
+                </div>
+            `;
+            continue;
+        }
+        
+        // Check for simple bullet points (-, •, *)
+        const simpleBulletMatch = line.match(/^\s*[-•*]\s+(.+)/);
+        if (simpleBulletMatch) {
+            const content = simpleBulletMatch[1];
+            
+            if (!inBulletList) {
+                formattedHtml += '<div class="bullet-list" style="margin: 8px 0 12px 0;">';
+                inBulletList = true;
+            }
+            
+            formattedHtml += `
+                <div class="bullet-item" style="
+                    display: flex;
+                    margin: 8px 0;
+                    line-height: 1.6;
+                ">
+                    <span style="
+                        display: inline-block;
+                        width: 20px;
+                        color: #3b82f6;
+                        font-size: 18px;
+                        flex-shrink: 0;
+                    ">•</span>
+                    <span style="flex: 1;">${formatInlineCode(content)}</span>
+                </div>
+            `;
+            continue;
+        }
+        
+        // Check for numbered list items (1., 2., etc.)
+        const numberedItemMatch = line.match(/^\s*(\d+)\.\s+(.+)/);
+        if (numberedItemMatch) {
+            const number = numberedItemMatch[1];
+            const content = numberedItemMatch[2];
+            
+            if (!inNumberedList) {
+                formattedHtml += '<div class="numbered-list" style="margin: 8px 0 12px 0;">';
+                inNumberedList = true;
+            }
+            
+            formattedHtml += `
+                <div class="numbered-item" style="
+                    display: flex;
+                    margin: 8px 0;
+                    line-height: 1.6;
+                ">
+                    <span style="
+                        display: inline-block;
+                        width: 28px;
+                        color: #3b82f6;
+                        font-weight: 500;
+                        flex-shrink: 0;
+                    ">${number}.</span>
+                    <span style="flex: 1;">${formatInlineCode(content)}</span>
+                </div>
+            `;
+            continue;
+        }
+        
+        // Regular paragraph text
+        if (inBulletList) {
+            formattedHtml += '</div>';
+            inBulletList = false;
+        }
+        if (inNumberedList) {
+            formattedHtml += '</div>';
+            inNumberedList = false;
+        }
+        
+        // Format paragraph with proper spacing
+        formattedHtml += `
+            <div class="text-paragraph" style="
+                margin: 12px 0;
+                line-height: 1.7;
+                color: #e2e8f0;
+            ">${formatInlineCode(line)}</div>
+        `;
+    }
+    
+    // Close any open lists
+    if (inBulletList) {
+        formattedHtml += '</div>';
+    }
+    if (inNumberedList) {
+        formattedHtml += '</div>';
+    }
+    
+    return formattedHtml;
+}
+
+// ================= 🔥 FORMAT INLINE CODE (NO BOLD MARKERS) =================
+function formatInlineCode(text) {
+    if (!text) return '';
+    
+    // First, remove any markdown bold markers (**text**)
+    let cleanText = text.replace(/\*\*(.*?)\*\*/g, '$1');
+    
+    // Then handle inline code (text between backticks)
+    if (!cleanText.includes('`')) {
+        return escapeHtml(cleanText);
+    }
+    
+    let result = '';
+    let parts = cleanText.split('`');
+    
+    for (let i = 0; i < parts.length; i++) {
+        if (i % 2 === 0) {
+            // Regular text - escape it
+            result += escapeHtml(parts[i]);
+        } else {
+            // Code - wrap in code tag but don't bold
+            result += `<code class="inline-code" style="
+                background: rgba(59, 130, 246, 0.2);
+                color: #93c5fd;
+                padding: 2px 6px;
+                border-radius: 4px;
+                font-family: 'JetBrains Mono', monospace;
+                font-size: 0.9em;
+            ">${escapeHtml(parts[i])}</code>`;
+        }
+    }
+    
+    return result;
+}
+
+// ================= 🔥 ADD CSS FOR BETTER READABILITY =================
+function addReadabilityStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+        /* Main answer container */
+        #qaAnswer {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            font-size: 15px;
+            line-height: 1.7;
+            color: #e2e8f0;
+            padding: 20px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        /* Section headers (1., 2., etc.) */
+        .section-header {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 28px 0 16px 0;
+            padding-bottom: 8px;
+            border-bottom: 2px solid rgba(59, 130, 246, 0.3);
+            color: #f0f9ff;
+        }
+        
+        .section-header span:first-child {
+            display: inline-block;
+            background: #3b82f6;
+            color: white;
+            border-radius: 6px;
+            padding: 4px 12px;
+            margin-right: 12px;
+            font-size: 16px;
+            font-weight: 500;
+        }
+        
+        /* Bullet points */
+        .bullet-list {
+            margin: 16px 0 20px 0;
+        }
+        
+        .bullet-item {
+            display: flex;
+            margin: 12px 0;
+            line-height: 1.7;
+            align-items: flex-start;
+        }
+        
+        .bullet-item span:first-child {
+            display: inline-block;
+            width: 24px;
+            color: #3b82f6;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+        
+        .bullet-item span:last-child {
+            flex: 1;
+        }
+        
+        /* Numbered lists */
+        .numbered-list {
+            margin: 16px 0 20px 0;
+        }
+        
+        .numbered-item {
+            display: flex;
+            margin: 12px 0;
+            line-height: 1.7;
+            align-items: flex-start;
+        }
+        
+        .numbered-item span:first-child {
+            display: inline-block;
+            width: 32px;
+            color: #3b82f6;
+            font-weight: 500;
+            flex-shrink: 0;
+        }
+        
+        .numbered-item span:last-child {
+            flex: 1;
+        }
+        
+        /* Regular paragraphs */
+        .text-paragraph {
+            margin: 16px 0;
+            line-height: 1.7;
+        }
+        
+        /* Paragraph spacing */
+        .paragraph-spacer {
+            height: 12px;
+        }
+        
+        /* Inline code */
+        .inline-code {
+            background: rgba(59, 130, 246, 0.15);
+            color: #93c5fd;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.9em;
+            border: 1px solid rgba(59, 130, 246, 0.2);
+        }
+        
+        /* Code blocks */
+        .code-block {
+            margin: 24px 0;
+            background: #1e293b;
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid #334155;
+        }
+        
+        .code-header {
+            background: #0f172a;
+            padding: 10px 16px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #334155;
+        }
+        
+        .code-language {
+            color: #94a3b8;
+            font-size: 13px;
+            font-weight: 500;
+            text-transform: uppercase;
+        }
+        
+        .copy-code-btn {
+            background: #334155;
+            border: none;
+            color: #e2e8f0;
+            padding: 4px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .copy-code-btn:hover {
+            background: #3b82f6;
+        }
+        
+        .code-block pre {
+            margin: 0;
+            padding: 20px;
+            overflow-x: auto;
+        }
+        
+        .code-block code {
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            color: #e2e8f0;
+        }
+        
+        /* Thinking animation */
+        .thinking {
+            color: #94a3b8;
+            font-style: italic;
+            padding: 20px;
+            text-align: center;
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 0.7; }
+            50% { opacity: 1; }
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+// Call this in your initialize function
+addReadabilityStyles();
+    // ================= 🔥 CLEAR BUTTON - SHIFT KEY REMOVED =================
     async function handleClearButton() {
-        console.log("🔄 Clear button clicked - Fresh start");
+        console.log("🔄 Clear button clicked - Fresh start (Shift key no longer does this)");
         
         currentTranscript = "";
         lastProcessedText = "";
@@ -674,7 +1339,6 @@ document.addEventListener("DOMContentLoaded", function() {
         
         qaQuestion.textContent = "Listening for new question...";
         qaQuestion.classList.remove("partial-text");
-        qaAnswer.innerHTML = "";
         
         if (chatRow && chatRow.style.display === "flex") {
             chatRow.style.display = "none";
@@ -694,14 +1358,16 @@ document.addEventListener("DOMContentLoaded", function() {
     // ================= IN-APP ALERT FUNCTION =================
     function showInAppAlert(message) {
         qaAnswer.innerHTML = `
-            <div class="alert-message">
-                <strong>${message}</strong>
+            <div class="alert-message" style="animation: slideIn 0.3s ease;">
+                <strong>⚠️ ${message}</strong>
             </div>
         `;
         
         setTimeout(() => {
             if (qaAnswer.innerHTML.includes("alert-message")) {
-                qaAnswer.innerHTML = "";
+                if (qaAnswer.innerHTML.includes(message)) {
+                    qaAnswer.innerHTML = "";
+                }
             }
         }, 3000);
     }
@@ -713,7 +1379,6 @@ document.addEventListener("DOMContentLoaded", function() {
         const resume = resumeText.value.trim();
         const context = contextInput.value.trim();
         
-        // 🔥 FIX 1: Show alert in application
         if (!company || !jobDesc || !resume) {
             showInAppAlert("Please fill in all required fields: Company, Job Description, and Resume");
             return;
@@ -989,7 +1654,6 @@ document.addEventListener("DOMContentLoaded", function() {
     
     // ================= DATABASE: DELETE SESSION =================
     window.deleteSession = async function(sessionId) {
-        // 🔥 FIX 2: Delete without confirmation dialog
         console.log(`🗑️ Deleting session ${sessionId}...`);
         
         try {
@@ -1004,9 +1668,7 @@ document.addEventListener("DOMContentLoaded", function() {
             const data = await response.json();
             
             if (data.success) {
-                // Reload sessions list
                 loadSessions();
-                // 🔥 FIX 2: Show success message in application
                 showInAppAlert("Session deleted successfully");
             }
         } catch (error) {
@@ -1020,14 +1682,13 @@ document.addEventListener("DOMContentLoaded", function() {
         console.log("⌨️ Setting up arrow key navigation...");
         
         document.addEventListener('keydown', function(event) {
-            // 🔥 FIX 6: Don't trigger hotkeys when typing in input fields
             const activeElement = document.activeElement;
             const isInputFocused = activeElement.tagName === 'INPUT' || 
                                  activeElement.tagName === 'TEXTAREA' ||
                                  activeElement.isContentEditable;
             
             if (isInputFocused) {
-                return; // Skip hotkeys when typing
+                return;
             }
             
             const qaAnswer = document.getElementById("qaAnswer");
@@ -1057,39 +1718,31 @@ document.addEventListener("DOMContentLoaded", function() {
         });
     }
     
-    // ================= HOTKEYS =================
+    // ================= 🔥 HOTKEYS - SHIFT REMOVED FROM CLEAR, <> MOVES OVERLAY =================
     function setupHotkeys() {
-        console.log("⌨️ Setting up keyboard hotkeys...");
+        console.log("⌨️ Setting up keyboard hotkeys (Shift removed from clear, <> moves overlay)...");
         
         document.addEventListener('keydown', function(event) {
-            // 🔥 FIX 6: Don't trigger hotkeys when typing in input fields
             const activeElement = document.activeElement;
             const isInputFocused = activeElement.tagName === 'INPUT' || 
                                  activeElement.tagName === 'TEXTAREA' ||
                                  activeElement.isContentEditable;
             
             if (isInputFocused) {
-                return; // Skip hotkeys when typing
+                return;
             }
             
-            // 🔥 FIX 5: Change Space to Enter for answer button
-            if (event.code === 'Enter' && !event.repeat && !event.ctrlKey && !event.altKey) {
-                console.log("⌨️ Enter key pressed - Triggering answer");
+            // 🔥 ANSWER BUTTON: SPACE key
+            if (event.code === 'Space' && !event.repeat && !event.ctrlKey && !event.altKey) {
+                console.log("⌨️ SPACE key pressed - Triggering answer");
                 event.preventDefault();
                 if (btnAnswer && !btnAnswer.disabled) {
                     handleAnswerButton();
                 }
             }
             
-            // Microphone toggle - M key
-            if (event.code === 'KeyM' && !event.repeat) {
-                console.log("⌨️ M key pressed - Toggling microphone");
-                event.preventDefault();
-                toggleMic();
-            }
-            
-            // Clear button - C key
-            if (event.code === 'KeyC' && !event.repeat) {
+            // 🔥 CLEAR BUTTON: C key ONLY (Shift removed)
+            if (event.code === 'KeyC' && !event.repeat && !event.ctrlKey && !event.altKey) {
                 console.log("⌨️ C key pressed - Clearing text");
                 event.preventDefault();
                 if (btnClear) {
@@ -1097,24 +1750,42 @@ document.addEventListener("DOMContentLoaded", function() {
                 }
             }
             
-            // System audio toggle - N key
+            // 🔥 MIC TOGGLE: M key
+            if (event.code === 'KeyM' && !event.repeat) {
+                console.log("⌨️ M key pressed - Toggling microphone");
+                event.preventDefault();
+                toggleMic();
+            }
+            
+            // 🔥 SYSTEM TOGGLE: N key
             if (event.code === 'KeyN' && !event.repeat) {
                 console.log("⌨️ N key pressed - Toggling system audio");
                 event.preventDefault();
                 toggleSystem();
             }
             
-            // Chat box toggle - Alt+Space
-            if (event.altKey && event.code === 'Space' && !event.repeat) {
-                console.log("⌨️ Alt+Space pressed - Toggling chat box");
+            // 🔥 CHAT BOX TOGGLE: Ctrl+V
+            if (event.ctrlKey && event.code === 'KeyV' && !event.repeat) {
+                console.log("⌨️ Ctrl+V pressed - Toggling chat box");
                 event.preventDefault();
                 if (toolbarChat) {
                     toolbarChat.click();
                 }
             }
+            
+            // 🔥 CHAT BOX TOGGLE: Ctrl+Shift+V (alternative)
+            if (event.ctrlKey && event.shiftKey && event.code === 'KeyV' && !event.repeat) {
+                console.log("⌨️ Ctrl+Shift+V pressed - Toggling chat box");
+                event.preventDefault();
+                if (toolbarChat) {
+                    toolbarChat.click();
+                }
+            }
+            
+            // 🔥 NOTE: Shift key is NOT handled here anymore - it's handled in setupOverlayMovement for <> keys
         });
         
-        console.log("✅ Hotkeys setup complete");
+        console.log("✅ Hotkeys setup complete - Shift key removed from clear, <> moves overlay");
     }
     
     // ================= CODE COPY FUNCTIONALITY =================
@@ -1272,221 +1943,118 @@ document.addEventListener("DOMContentLoaded", function() {
     function addStyles() {
         const style = document.createElement('style');
         style.textContent = `
-            /* Alert message styling */
+            /* 🔥 FIX 1: HAND CURSOR for all buttons */
+            button, .tab, .ctrl, .circle-icon, .square-icon, .pill, 
+            .session-item, .nav-btn, .copy-button, .copy-code-btn,
+            #toolbarChat, #chatSend, [role="button"], [type="button"],
+            [type="submit"], [type="reset"] {
+                cursor: pointer !important;
+            }
+            
+            button:disabled, .ctrl:disabled, .circle-icon:disabled,
+            .square-icon:disabled, .pill:disabled, .nav-btn:disabled {
+                cursor: not-allowed !important;
+            }
+            
+            input[type="text"], input[type="email"], input[type="password"],
+            textarea, select, .chat-input, .text-input {
+                cursor: text !important;
+            }
+            
+            /* 🔥 FIX 2: Screen sharing cursor visibility */
+            * {
+                caret-color: #3b82f6;
+            }
+            
+            button:focus, .ctrl:focus, .circle-icon:focus, .square-icon:focus {
+                outline: 2px solid #3b82f6 !important;
+                outline-offset: 2px;
+            }
+            
+            /* 🔥 DRAG ANYWHERE cursor */
+            .drag-region, .window-shell, .ai-overlay-bar, .ai-panel-header {
+                -webkit-app-region: drag;
+            }
+            
+            .no-drag, button, input, textarea, select, a {
+                -webkit-app-region: no-drag;
+            }
+            
+            body.dragging, body.dragging * {
+                cursor: grabbing !important;
+                user-select: none;
+            }
+            
+            /* Alert message styling - IN-APP, no tab */
             .alert-message {
                 padding: 12px 16px;
-                background-color: #fff3cd;
-                border: 1px solid #ffeaa7;
-                border-radius: 6px;
-                color: #856404;
+                background-color: rgba(59, 130, 246, 0.2);
+                border: 1px solid #3b82f6;
+                border-radius: 8px;
+                color: #f9fafb;
                 margin: 10px 0;
-                animation: fadeIn 0.3s;
-            }
-            
-            .partial-text {
-                color: #666 !important;
-                font-style: italic !important;
-                opacity: 0.8;
-            }
-            
-            .thinking {
-                color: #666;
-                font-style: italic;
-                padding: 12px;
-                background-color: #f5f5f5;
-                border-radius: 6px;
-                animation: pulse 1.5s infinite;
-            }
-            
-            .error {
-                color: #d32f2f;
-                padding: 12px;
-                background-color: #ffebee;
-                border-radius: 6px;
-                border-left: 4px solid #d32f2f;
-                margin: 10px 0;
-            }
-            
-            .info {
-                color: #1976d2;
-                padding: 12px;
-                background-color: #e3f2fd;
-                border-radius: 6px;
-                border-left: 4px solid #1976d2;
-                margin: 10px 0;
-            }
-            
-            /* Chat box styles */
-            #chatRow {
-                display: none;
-                margin-top: 16px;
-                padding: 12px;
-                background: rgba(15, 23, 42, 0.8);
-                border-radius: 12px;
-                border: 1px solid rgba(59, 130, 246, 0.3);
-                backdrop-filter: blur(10px);
                 animation: slideIn 0.3s ease;
             }
             
-            #chatInput {
-                flex: 1;
-                padding: 10px 16px;
-                border-radius: 8px;
-                border: 1px solid rgba(148, 163, 184, 0.5);
-                background: rgba(30, 41, 59, 0.7);
-                color: #f9fafb;
-                font-size: 14px;
-                outline: none;
-                transition: all 0.2s;
+            @keyframes slideIn {
+                from { opacity: 0; transform: translateY(-10px); }
+                to { opacity: 1; transform: translateY(0); }
             }
             
-            #chatInput:focus {
-                border-color: #3b82f6;
-                box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+            .partial-text {
+                color: #94a3b8 !important;
+                font-style: italic !important;
             }
             
-            #chatSend {
-                background: #3b82f6;
-                color: white;
-                border: none;
-                padding: 10px 20px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-weight: 500;
-                transition: all 0.2s;
+            .thinking {
+                color: #94a3b8;
+                font-style: italic;
+                padding: 16px;
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                animation: pulse 1.5s infinite;
             }
             
-            #chatSend:hover {
-                background: #2563eb;
-                transform: translateY(-1px);
+            .thinking:before {
+                content: "";
+                width: 16px;
+                height: 16px;
+                border: 2px solid #3b82f6;
+                border-top-color: transparent;
+                border-radius: 50%;
+                animation: spin 1s linear infinite;
             }
             
-            #toolbarChat.active {
-                background: rgba(59, 130, 246, 0.2);
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+            
+            @keyframes pulse {
+                0%, 100% { opacity: 0.6; }
+                50% { opacity: 1; }
+            }
+            
+            .error {
+                color: #f87171;
+                padding: 12px;
+                background: rgba(239, 68, 68, 0.1);
+                border-radius: 6px;
+                border-left: 4px solid #f87171;
+            }
+            
+            /* Mic/System indicator states */
+            .circle-icon.is-on {
+                background: rgba(59, 130, 246, 0.3);
                 border-color: #3b82f6;
                 color: #3b82f6;
             }
             
-            /* Chat GPT code blocks */
-            .chatgpt-code-block {
-                margin: 16px 0;
-                background: #0f172a;
-                border-radius: 8px;
-                border: 1px solid #334155;
-                overflow: hidden;
-                font-family: 'SF Mono', Monaco, 'Cascadia Mono', monospace;
-            }
-            
-            .chatgpt-code-block .code-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 8px 12px;
-                background: #1e293b;
-                border-bottom: 1px solid #334155;
-            }
-            
-            .chatgpt-code-block .code-language {
-                color: #94a3b8;
-                font-size: 12px;
-                font-weight: 500;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-            }
-            
-            .chatgpt-code-block .copy-button {
-                background: #3b82f6;
-                color: white;
-                border: none;
-                padding: 4px 12px;
-                border-radius: 4px;
-                font-size: 11px;
-                cursor: pointer;
-                transition: all 0.2s;
-                font-family: 'Inter', sans-serif;
-            }
-            
-            .chatgpt-code-block .copy-button:hover {
-                background: #2563eb;
-                transform: translateY(-1px);
-            }
-            
-            .chatgpt-code-block .copy-button.copied {
-                background: #10b981;
-            }
-            
-            .chatgpt-code-block pre {
-                margin: 0;
-                padding: 0;
-                overflow-x: auto;
-            }
-            
-            .chatgpt-code-block code {
-                display: block;
-                padding: 16px;
-                font-size: 13px;
-                line-height: 1.5;
-                color: #e2e8f0;
-                white-space: pre;
-                tab-size: 4;
-            }
-            
-            /* Inline code */
-            .inline-code {
-                background: rgba(30, 41, 59, 0.7);
-                padding: 2px 6px;
-                border-radius: 4px;
-                font-family: 'SF Mono', monospace;
-                font-size: 13px;
-                color: #fbbf24;
-                border: 1px solid #475569;
-            }
-            
-            /* Answer panel scrollbar - Single scrollbar */
-            .qa-answer {
-                max-height: 60vh;
-                overflow-y: auto;
-                scrollbar-width: thin;
-                scrollbar-color: #475569 rgba(30, 41, 59, 0.3);
-            }
-            
-            .qa-answer::-webkit-scrollbar {
-                width: 8px;
-            }
-            
-            .qa-answer::-webkit-scrollbar-track {
-                background: rgba(30, 41, 59, 0.3);
-                border-radius: 4px;
-            }
-            
-            .qa-answer::-webkit-scrollbar-thumb {
-                background: #475569;
-                border-radius: 4px;
-            }
-            
-            .qa-answer::-webkit-scrollbar-thumb:hover {
-                background: #64748b;
-            }
-            
-            @keyframes slideIn {
-                from {
-                    opacity: 0;
-                    transform: translateY(-10px);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
-            }
-            
-            @keyframes fadeIn {
-                from { opacity: 0; }
-                to { opacity: 1; }
-            }
-            
-            @keyframes pulse {
-                0%, 100% { opacity: 1; }
-                50% { opacity: 0.7; }
+            .circle-icon.is-off {
+                opacity: 0.5;
+                background: rgba(148, 163, 184, 0.1);
+                border-color: rgba(148, 163, 184, 0.4);
+                color: rgba(148, 163, 184, 0.6);
             }
         `;
         document.head.appendChild(style);
@@ -1495,7 +2063,13 @@ document.addEventListener("DOMContentLoaded", function() {
     
     // ================= INITIALIZATION =================
     function initialize() {
-        console.log("🔧 Initializing application...");
+        console.log("🔧 Initializing application with new features...");
+        
+        // 🔥 NEW: Cursor control - NO HAND SYMBOLS
+        setupCursorControl();
+        
+        // 🔥 NEW: Overlay movement with <> keys
+        setupOverlayMovement();
         
         addStyles();
         setupWindowControls();
@@ -1506,6 +2080,7 @@ document.addEventListener("DOMContentLoaded", function() {
         setupHotkeys();
         setupCodeCopyButtons();
         setupArrowKeyNavigation();
+        setupDragAnywhere();
         
         micMuted = false;
         systemMuted = false;
@@ -1529,7 +2104,7 @@ document.addEventListener("DOMContentLoaded", function() {
             loadSessions();
         }
         
-        console.log("✅ Application initialized successfully");
+        console.log("✅ Application initialized - NO HAND SYMBOLS, <> moves overlay, cursor hidden during screen share");
     }
     
     // ================= START APPLICATION =================
@@ -1550,4 +2125,54 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}// Add this to your addStyles function in renderer.js
+function addStyles() {
+    const style = document.createElement('style');
+    style.textContent = `
+        /* Force hardware acceleration for smooth updates */
+        #qaAnswer {
+            will-change: contents;
+            transform: translateZ(0);
+            backface-visibility: hidden;
+            perspective: 1000px;
+        }
+        
+        /* Ensure thinking message is visible */
+        .thinking {
+            color: #94a3b8;
+            font-style: italic;
+            padding: 16px;
+            animation: pulse 1.5s infinite;
+        }
+        
+        /* Debug overlay to see updates */
+        .debug-timer {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.8);
+            color: #0f0;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            z-index: 9999;
+            pointer-events: none;
+        }
+    `;
+    document.head.appendChild(style);
+    
+    // Add debug timer
+    const debugTimer = document.createElement('div');
+    debugTimer.className = 'debug-timer';
+    debugTimer.id = 'debugTimer';
+    document.body.appendChild(debugTimer);
+    
+    // Update debug timer
+    setInterval(() => {
+        const timer = document.getElementById('debugTimer');
+        if (timer) {
+            timer.textContent = `UI Time: ${new Date().toLocaleTimeString()}.${Date.now() % 1000}`;
+        }
+    }, 100);
 }

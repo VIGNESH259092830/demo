@@ -336,3 +336,34 @@ class State:
 
 # Global state instance
 state = State()
+# In app/shared/state.py - add this method
+
+# In app/shared/state.py - replace the get_text_for_sse method
+
+# In app/shared/state.py - REPLACE with this version
+
+def get_text_for_sse(self):
+    """
+    Get text data for SSE - Include AI status for UI feedback
+    """
+    with self.lock:
+        current_time = time.time()
+        time_since_audio = current_time - self.last_audio_ts
+        time_since_partial = current_time - self.last_partial_update
+        
+        # Show partial if recent (within 1.5 seconds)
+        has_partial = (len(self.partial_buffer) > 0 and 
+                      time_since_partial < 1.5 and
+                      time_since_audio < 3.0)
+        
+        # 🔥 CRITICAL: Return current_line even during AI response (but empty if AI responding)
+        # This allows the frontend to know AI is responding
+        return {
+            "current_line": self.current_line,  # Don't clear - let frontend handle
+            "partial_buffer": self.partial_buffer,
+            "last_source": self.last_source,
+            "last_audio_seconds_ago": time_since_audio,
+            "has_partial": has_partial,
+            "timestamp": current_time,
+            "is_ai_responding": self.is_ai_responding  # 🔥 ADD THIS for frontend to know
+        }

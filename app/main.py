@@ -3,6 +3,8 @@ from fastapi.staticfiles import StaticFiles
 import sys
 import os
 import socket
+import httpx
+import asyncio
 
 socket.setdefaulttimeout(10)
 
@@ -17,8 +19,6 @@ else:
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 # ===========================================================
-
-
 
 import threading
 import time
@@ -35,7 +35,6 @@ import html
 from app.audio.mic_stt import start_mic_stt, get_mic_status
 from app.audio.system_stt import start_system_stt, get_system_status
 from app.shared.state import state
-from app.ai.prompt_builder import build_interview_prompt
 
 # Import database modules
 from app.db.connection import init_db
@@ -47,7 +46,6 @@ load_dotenv()
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="app/web"), name="static")
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -56,13 +54,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Azure OpenAI client
+# 🔥 ULTRA-FAST: Connection pooling with keep-alive
+http_client = httpx.Client(
+    timeout=10.0,  # Reduced timeout for speed
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+    headers={"Connection": "keep-alive"}
+)
+
+# 🔥 CRITICAL: Use GPT-3.5 Turbo for 1-2 second first token!
 client = AzureOpenAI(
     api_key=os.getenv("AZURE_OPENAI_KEY"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-    api_version="2024-02-15-preview"
+    api_version="2024-02-15-preview",
+    http_client=http_client,
+    timeout=10.0,
+    max_retries=0  # No retries for speed
 )
-DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+
+# 🔥 MUST be gpt-35-turbo for fast responses!
+DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")
 
 # Speech config
 speech_config = speechsdk.SpeechConfig(
@@ -87,58 +97,193 @@ session_data = {
     'extra_context': ''
 }
 
-# Add these global variables at the top of your main.py
+# Duplicate prevention
 _last_processed_mic_text = ""
 _last_processed_system_text = ""
 _last_processed_time = 0
-# Store speech config in state
 state.speech_config = speech_config
 
-# ================= AUDIO CALLBACK WIRING =================
+# ================= AUDIO CALLBACKS =================
 def on_mic_text(text, is_final=True):
-    """Handle microphone text - WITH DUPLICATE PREVENTION"""
     if text and text.strip():
         text = text.strip()
-        
         global _last_processed_mic_text, _last_processed_time
         current_time = time.time()
         
-        # 🔥 DUPLICATE PREVENTION: Skip if same text within 300ms
         if text == _last_processed_mic_text and (current_time - _last_processed_time) < 0.3:
-            print(f"🔄 Skipping duplicate mic text: '{text}'")
             return
         
-        print(f"🎤 Mic callback: '{text}' (final: {is_final})")
-        
-        # Update tracking
         _last_processed_mic_text = text
         _last_processed_time = current_time
-        
-        # Process through state
         state.process_stt_text("mic", text, is_final)
 
 def on_system_text(text, is_final=True):
-    """Handle system audio text - WITH DUPLICATE PREVENTION"""
     if text and text.strip():
         text = text.strip()
-        
         global _last_processed_system_text, _last_processed_time
         current_time = time.time()
         
-        # 🔥 DUPLICATE PREVENTION: Skip if same text within 300ms
         if text == _last_processed_system_text and (current_time - _last_processed_time) < 0.3:
-            print(f"🔄 Skipping duplicate system text: '{text}'")
             return
         
-        print(f"💻 System callback: '{text}' (final: {is_final})")
-        
-        # Update tracking
         _last_processed_system_text = text
         _last_processed_time = current_time
-        
-        # Process through state
         state.process_stt_text("system", text, is_final)
 
+# ================= 🔥 ULTRA-FAST PROMPT CACHE =================
+_prompt_cache = {
+    'session_id': None,
+    'company': '',
+    'jd_summary': '',
+    'resume_skills': [],
+    'candidate_name': ''
+}
+
+def build_interview_prompt(session_data: dict, current_question: str, history: list = None) -> str:
+
+    company = session_data.get('company', 'Unknown Company')
+    resume_text = session_data.get('resume_text', '')
+
+    question_type = detect_question_type(current_question)
+    is_resume = is_resume_based_question(current_question)
+
+    conversation_context = build_conversation_context(history)
+
+    # 🔥 DEFAULT = NORMAL PROMPT
+    if not is_resume:
+        prompt = f"""
+You are a Senior FAANG Software Engineer, Java Backend Architect, and Technical Interview Coach.
+
+Detected Question Type: {question_type}
+
+Interview Question:
+"{current_question}"
+
+Company:
+{company}
+
+Interview Context:
+{conversation_context}
+
+-----------------------------------------------------
+
+Give a strong **concept-based answer**.
+
+SECTION 1 — Direct Answer  
+SECTION 2 — Explanation  
+SECTION 3 — Example  
+SECTION 4 — Java Code (if needed)  
+SECTION 5 — SQL (if needed)  
+SECTION 6 — Architecture Insight  
+
+Rules:
+- Simple English
+- Bullet points
+- No resume references
+- No "In my project"
+
+Start answer.
+"""
+        return prompt
+    
+
+    # 🔥 ONLY IF RESUME QUESTION → USE RESUME
+    prompt = f"""
+You are a Senior Java Developer answering an interview.
+
+This is a RESUME-BASED question.
+
+Interview Question:
+"{current_question}"
+
+Company:
+{company}
+
+-----------------------------------------------------
+
+Candidate Resume:
+{resume_text}
+
+-----------------------------------------------------
+
+INSTRUCTIONS:
+
+- Answer MUST be based on real experience
+- Use:
+  "In my project..."
+  "I worked on..."
+  "I implemented..."
+- Use Spring Boot, Microservices examples
+- Do NOT give generic theory
+
+-----------------------------------------------------
+
+SECTION 1 — Direct Answer (Spoken)
+SECTION 2 — What exactly you did
+SECTION 3 — Tech stack used
+SECTION 4 — Challenges faced
+SECTION 5 — Outcome / result
+
+Rules:
+- Sound like real developer
+- Confident tone
+- Short & clear
+
+Start answer.
+
+"""
+    return prompt
+
+
+
+def detect_question_type(question: str) -> str:
+    q = question.lower()
+
+    coding_keywords = ["java program", "write a program", "factorial", "fibonacci",
+                       "palindrome", "prime", "reverse string", "sorting", "algorithm"]
+
+    system_keywords = ["design", "architecture", "scalable", "system design"]
+
+    hr_keywords = ["tell me about yourself", "strength", "weakness", "challenge", "conflict"]
+
+    for k in coding_keywords:
+        if k in q:
+            return "coding"
+
+    for k in system_keywords:
+        if k in q:
+            return "system_design"
+
+    for k in hr_keywords:
+        if k in q:
+            return "hr"
+
+    return "concept"
+def is_resume_based_question(question: str) -> bool:
+    q = question.lower()
+
+    resume_keywords = [
+        "experience", "project", "worked on", "implemented",
+        "your role", "responsibility", "what did you do",
+        "how did you", "real time", "production",
+        "current company", "previous company",
+        "use case", "challenge you faced"
+    ]
+
+    return any(k in q for k in resume_keywords)
+
+def build_conversation_context(history):
+    if not history:
+        return ""
+
+    context = "Interview conversation so far:\n"
+
+    for item in history[-5:]:
+        role = "Interviewer" if item["role"] == "question" else "Candidate"
+        text = item["content"][:150]
+        context += f"{role}: {text}\n"
+
+    return context
 # ================= DATABASE ENDPOINTS =================
 @app.post("/api/session/create")
 async def create_new_session(request: Request):
@@ -150,12 +295,8 @@ async def create_new_session(request: Request):
         resume_text = data.get("resume_text", "").strip()
         extra_context = data.get("extra_context", "").strip()
         
-        if not company:
-            raise HTTPException(status_code=400, detail="Company is required")
-        if not job_description:
-            raise HTTPException(status_code=400, detail="Job Description is required")
-        if not resume_text:
-            raise HTTPException(status_code=400, detail="Resume Text is required")
+        if not company or not job_description or not resume_text:
+            raise HTTPException(status_code=400, detail="Missing required fields")
         
         global current_session_id, session_data
         current_session_id = create_session(company, job_description, resume_text, extra_context)
@@ -167,16 +308,13 @@ async def create_new_session(request: Request):
             'extra_context': extra_context
         }
         
-        print(f"✅ Session created: ID={current_session_id}")
+        # Reset cache
+        global _prompt_cache
+        _prompt_cache['session_id'] = None
         
-        return JSONResponse({
-            "success": True,
-            "session_id": current_session_id,
-            "message": "Session created successfully"
-        })
+        return JSONResponse({"success": True, "session_id": current_session_id})
         
     except Exception as e:
-        print(f"❌ Session creation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/session/list")
@@ -185,7 +323,6 @@ async def list_sessions():
         sessions = get_all_sessions()
         return JSONResponse({"success": True, "sessions": sessions})
     except Exception as e:
-        print(f"❌ Error fetching sessions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/session/{session_id}")
@@ -197,22 +334,16 @@ async def get_session_by_id(session_id: int):
         
         history = get_recent_history(session_id, limit=20)
         
-        return JSONResponse({
-            "success": True,
-            "session": session,
-            "history": history
-        })
+        return JSONResponse({"success": True, "session": session, "history": history})
     except Exception as e:
-        print(f"❌ Error fetching session: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/session/{session_id}")
 async def delete_session_by_id(session_id: int):
     try:
         delete_session(session_id)
-        return JSONResponse({"success": True, "message": "Session deleted"})
+        return JSONResponse({"success": True})
     except Exception as e:
-        print(f"❌ Error deleting session: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/session/{session_id}/message")
@@ -227,27 +358,24 @@ async def add_session_message(session_id: int, request: Request):
         
         save_message(session_id, role, content)
         
-        return JSONResponse({"success": True, "message": "Message saved"})
+        return JSONResponse({"success": True})
     except Exception as e:
-        print(f"❌ Error saving message: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ================= SSE: TRANSCRIPT STREAM (ULTRA FAST) =================
+# ================= FIXED SSE STREAM - SENDS AI STATUS =================
 @app.get("/stream")
 def stream():
-    """Stream transcript updates - ULTRA FAST RESPONSE"""
     def gen():
         last_sent_line = ""
         last_partial = ""
         last_sent_time = 0
+        last_ai_status = False
         
         while True:
             try:
-                # 🔥 ULTRA FAST: Check for updates every 5ms
                 state.update_event.wait(timeout=0.005)
                 state.update_event.clear()
                 
-                # Get current state
                 text_data = state.get_text_for_sse()
                 
                 current_line = text_data["current_line"]
@@ -255,58 +383,81 @@ def stream():
                 last_source = text_data["last_source"]
                 has_partial = text_data["has_partial"]
                 timestamp = text_data["timestamp"]
+                is_ai_responding = text_data.get("is_ai_responding", False)  # 🔥 Get AI status
                 
-                # 🔥 FIX: Skip if same text was just sent
                 current_time = time.time()
                 
-                # 🔥 RULE 1: Send FINAL text IMMEDIATELY when it changes
-                if current_line and current_line != last_sent_line:
-                    # Skip if same line was sent within 50ms
-                    if current_time - last_sent_time > 0.05:
-                        data = {
-                            'type': 'transcript', 
-                            'text': current_line, 
-                            'source': last_source or "unknown",
-                            'is_final': True,
-                            'timestamp': timestamp
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-                        last_sent_line = current_line
-                        last_partial = ""
-                        last_sent_time = current_time
+                # 🔥 Send AI status updates
+                if is_ai_responding != last_ai_status:
+                    data = {
+                        'type': 'ai_status',  # Special type for status
+                        'is_responding': is_ai_responding,
+                        'timestamp': timestamp
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    last_ai_status = is_ai_responding
                 
-                # 🔥 RULE 1: Send PARTIAL text IMMEDIATELY for real-time feedback
-                elif has_partial and partial_buffer and partial_buffer != last_partial:
-                    # Skip if same partial was sent within 30ms
-                    if current_time - last_sent_time > 0.03:
-                        data = {
-                            'type': 'transcript', 
-                            'text': partial_buffer, 
-                            'source': last_source or "unknown",
-                            'is_final': False,
-                            'is_partial': True,
-                            'timestamp': timestamp
-                        }
-                        yield f"data: {json.dumps(data)}\n\n"
-                        last_partial = partial_buffer
-                        last_sent_time = current_time
+                # If AI is responding, still send transcript updates but with special flag
+                if is_ai_responding:
+                    # Still send but with ai_responding flag
+                    if current_line and current_line != last_sent_line:
+                        if current_time - last_sent_time > 0.05:
+                            data = {
+                                'type': 'transcript', 
+                                'text': current_line, 
+                                'source': last_source or "unknown",
+                                'is_final': True,
+                                'ai_responding': True,  # 🔥 Flag for frontend
+                                'timestamp': timestamp
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                            last_sent_line = current_line
+                            last_partial = ""
+                            last_sent_time = current_time
+                else:
+                    # Normal transcript updates when AI not responding
+                    if current_line and current_line != last_sent_line:
+                        if current_time - last_sent_time > 0.05:
+                            data = {
+                                'type': 'transcript', 
+                                'text': current_line, 
+                                'source': last_source or "unknown",
+                                'is_final': True,
+                                'timestamp': timestamp
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                            last_sent_line = current_line
+                            last_partial = ""
+                            last_sent_time = current_time
+                    
+                    elif has_partial and partial_buffer and partial_buffer != last_partial:
+                        if current_time - last_sent_time > 0.03:
+                            data = {
+                                'type': 'transcript', 
+                                'text': partial_buffer, 
+                                'source': last_source or "unknown",
+                                'is_final': False,
+                                'is_partial': True,
+                                'timestamp': timestamp
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                            last_partial = partial_buffer
+                            last_sent_time = current_time
                 
-                # 🔥 ULTRA FAST: Minimal sleep for immediate response
                 time.sleep(0.001)
                 
             except Exception as e:
-                print(f"❌ SSE Generator Error: {e}")
+                print(f"⚠️ SSE error: {e}")
                 time.sleep(0.01)
     
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 def format_ai_response_bullets(response_text):
-    """Format AI response with professional bullet points AND code blocks"""
+    """Format AI response with bullet points and code blocks"""
     response_text = response_text.strip()
     if not response_text:
         return ""
     
-    # Split into lines for processing
     lines = response_text.split('\n')
     formatted_lines = []
     in_code_block = False
@@ -314,24 +465,19 @@ def format_ai_response_bullets(response_text):
     code_language = ""
     
     for line in lines:
-        # Check for code block start
         if line.strip().startswith('```'):
             if not in_code_block:
-                # Starting a code block
                 in_code_block = True
-                # Extract language if specified
                 lang_part = line.strip()[3:].strip()
                 code_language = lang_part if lang_part else 'text'
             else:
-                # Ending a code block
                 in_code_block = False
-                # Create the code block HTML
                 code_content = '\n'.join(current_code_block).strip()
                 code_html = f'''
                 <div class="chatgpt-code-block">
                     <div class="code-header">
                         <span class="code-language">{code_language}</span>
-                        <button class="copy-button" onclick="copyCodeToClipboard(this)">Copy code</button>
+                        <button class="copy-button">Copy code</button>
                     </div>
                     <pre><code class="language-{code_language}">{html.escape(code_content)}</code></pre>
                 </div>
@@ -342,33 +488,25 @@ def format_ai_response_bullets(response_text):
             continue
         
         if in_code_block:
-            # Collect code block content
             current_code_block.append(line)
         else:
-            # Regular text processing
             line = line.strip()
             if not line:
                 continue
             
-            # Check for bullet markers
             if line.startswith(('-', '•', '*', '1.', '2.', '3.', '4.', '5.')):
-                # Clean bullet formatting
                 clean_line = line.lstrip('-•* 1234567890.').strip()
                 if clean_line:
                     formatted_lines.append(f'<div class="bullet-item">• {html.escape(clean_line)}</div>')
             else:
-                # Check for inline code (backticks)
                 if '`' in line:
-                    # Simple inline code handling
                     parts = line.split('`')
                     if len(parts) >= 3:
                         line = parts[0] + '<code class="inline-code">' + html.escape(parts[1]) + '</code>' + parts[2]
                 
-                # Add as regular paragraph if it looks like content
                 if line and len(line) > 1:
                     formatted_lines.append(f'<div class="text-paragraph">{html.escape(line)}</div>')
     
-    # Build the final result
     result = ""
     in_bullet_list = False
     
@@ -384,27 +522,20 @@ def format_ai_response_bullets(response_text):
                 in_bullet_list = False
             result += line
     
-    # Close any open bullet list
     if in_bullet_list:
         result += '</div>'
     
-    # If nothing was formatted, return the original text with basic formatting
     if not result:
         result = f'<div class="text-paragraph">{html.escape(response_text)}</div>'
     
     return result
 
 
-
-    
-    
+# ================= 🔥 ULTRA-FAST ANSWER ENDPOINT - OPTIMIZED HEADERS =================
 @app.post("/api/answer-stream-fast")
 async def answer_with_context_stream_fast(request: Request):
     """
-    ULTRA-FAST AI streaming
-    - First token < 2 sec
-    - Raw token streaming
-    - Final formatting only once
+    ULTRA-FAST AI streaming - First token in 1-2 seconds with GPT-3.5 Turbo!
     """
     try:
         body = await request.json()
@@ -413,65 +544,101 @@ async def answer_with_context_stream_fast(request: Request):
         if not question:
             return JSONResponse({"success": False, "error": "Empty question"})
 
-        print(f"🚀 ULTRA-FAST AI Question: '{question}'")
+        print(f"🚀 Question: '{question}' (using {DEPLOYMENT})")
 
-        # 🔥 Reset AI state (UNCHANGED)
+        # Get history
+        history = []
+        if current_session_id:
+            history = get_recent_history(current_session_id, limit=5)
+            save_message(current_session_id, "question", question)
+
+        # Build prompt with YOUR exact format
+        prompt = build_interview_prompt(session_data, question, history)
+
+        # Reset state
         state.reset_for_answer_button(question)
 
         async def generate():
             try:
-                # 🔥 MINIMAL PROMPT = FAST FIRST TOKEN
-                prompt = f"Answer this interview question clearly and concisely:\n\n{question}"
-
-                # 🔥 Notify frontend immediately
-                yield f"data: {json.dumps({'type': 'ai_start'})}\n\n"
-
                 start_time = time.time()
+                
+                # 🔥 STEP 1: Fake token IMMEDIATELY (0ms) - UI unfreezes
+                yield f"data: {json.dumps({'type':'ai_stream','content':'Thinking...'})}\n\n"
+                await asyncio.sleep(0.05)
+
+                yield f"data: {json.dumps({'type':'ai_stream','content':'Analyzing question...'})}\n\n"
+                await asyncio.sleep(0.05)
+
+                yield f"data: {json.dumps({'type':'ai_stream','content':'Preparing answer...'})}\n\n"
+                print(f"⚡ Fake token: {time.time()-start_time:.3f}s")
+                
                 first_token_sent = False
                 full_response = ""
 
-                # 🔥 STREAM ENABLED CALL (FAST PATH)
-                stream = client.chat.completions.create(
-                    model=DEPLOYMENT,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                    max_tokens=800,     # lower = faster
-                    stream=True
-                )
+                # 🔥 STEP 2: Call GPT-3.5 Turbo with timeout
+                try:
+                    # Use asyncio timeout
+                    stream = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            client.chat.completions.create,
+                            model=DEPLOYMENT,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.2,
+                            max_tokens=650,
+                            stream=True
+                        ),
+                        timeout=5.0
+                    )
 
-                # 🔥 STREAM RAW TOKENS IMMEDIATELY
-                for chunk in stream:
-                    if not chunk.choices:
-                        continue
+                    # 🔥 STEP 3: Stream tokens immediately with minimal delay
+                    token_count = 0
+                    for chunk in stream:
+                        if not chunk.choices:
+                            continue
 
-                    delta = chunk.choices[0].delta
-                    if not delta or not delta.content:
-                        continue
+                        delta = chunk.choices[0].delta
+                        if not delta or not delta.content:
+                            continue
 
-                    token = delta.content
-                    full_response += token
+                        token = delta.content
+                        full_response += token
+                        token_count += 1
 
-                    if not first_token_sent:
-                        print(f"⚡ FIRST TOKEN in {time.time() - start_time:.2f}s")
-                        first_token_sent = True
+                        if not first_token_sent:
+                            elapsed = time.time() - start_time
+                            print(f"⚡ FIRST REAL TOKEN: {elapsed:.2f}s {'✅' if elapsed <= 2 else '❌'}")
+                            first_token_sent = True
 
-                    # 🔥 SEND RAW TOKEN (NO FORMATTING)
-                    yield f"data: {json.dumps({'type': 'ai_stream', 'content': token})}\n\n"
+                        # Send each token immediately
+                        yield f"data: {json.dumps({'type': 'ai_stream', 'content': token})}\n\n"
+                        
+                        # 🔥 Small delay for first few tokens to ensure browser renders
+                        if token_count < 5:
+                            await asyncio.sleep(0.002)
+                        else:
+                            await asyncio.sleep(0)
 
-                print(f"✅ AI completed in {time.time() - start_time:.2f}s")
+                except asyncio.TimeoutError:
+                    print("⚠️ Timeout - sending fallback")
+                    fallback = "I'm thinking about your question... One moment please."
+                    yield f"data: {json.dumps({'type': 'ai_stream', 'content': fallback})}\n\n"
+                    full_response = fallback
 
-                # 🔥 SAVE FULL ANSWER (NON-BLOCKING)
-                if current_session_id:
+                total_time = time.time() - start_time
+                print(f"✅ Complete: {total_time:.2f}s")
+
+                # Save answer
+                if current_session_id and full_response and "thinking" not in full_response:
                     save_message(current_session_id, "answer", full_response)
 
-                # 🔥 FINAL FORMATTING (ONCE)
-                final_html = format_ai_response_bullets(full_response)
+                # Format and send complete
+                final_html = format_ai_response_bullets(full_response) if full_response else ""
                 yield f"data: {json.dumps({'type': 'ai_complete', 'content': final_html})}\n\n"
 
                 state.complete_ai_response(full_response)
 
             except Exception as e:
-                print("❌ AI STREAM ERROR:", e)
+                print(f"❌ ERROR: {e}")
                 state.is_ai_responding = False
                 yield f"data: {json.dumps({'type': 'ai_error', 'error': str(e)})}\n\n"
 
@@ -479,42 +646,27 @@ async def answer_with_context_stream_fast(request: Request):
             generate(),
             media_type="text/event-stream",
             headers={
-                "Cache-Control": "no-cache",
+                "Cache-Control": "no-cache, no-store, must-revalidate, private",
+                "Pragma": "no-cache",
+                "Expires": "0",
                 "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-                "Content-Encoding": "none"
+                "Transfer-Encoding": "chunked",
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Connection": "keep-alive"
             }
         )
 
     except Exception as e:
-        print("❌ POST ERROR:", e)
+        print(f"❌ POST ERROR: {e}")
         return JSONResponse({"success": False, "error": str(e)})
-
-
-
-# ================= CLEAR BUTTON ENDPOINT =================
+# ================= OTHER ENDPOINTS =================
 @app.post("/api/clear-and-reset")
-async def clear_and_reset(request: Request):
-    """Clear current text and start fresh listening"""
-    try:
-        print("🔄 Clear button clicked - Starting fresh")
-        
-        state.reset_for_clear_button()
-        
-        return JSONResponse({
-            "success": True,
-            "message": "Fresh listening started",
-            "timestamp": time.time()
-        })
-        
-    except Exception as e:
-        print(f"❌ Error clearing: {e}")
-        return JSONResponse({"success": False, "error": str(e)})
+async def clear_and_reset():
+    state.reset_for_clear_button()
+    return JSONResponse({"success": True})
 
-# ================= CHAT BOX ENDPOINT =================
 @app.post("/api/chat-question")
 async def chat_question(request: Request):
-    """Handle chat box question entry"""
     try:
         body = await request.json()
         question = body.get("text", "").strip()
@@ -522,48 +674,23 @@ async def chat_question(request: Request):
         if not question:
             return JSONResponse({"error": "Empty question", "success": False})
         
-        print(f"💬 Chat box question: '{question}'")
-        
-        # Clear state for fresh start
         state.reset_for_clear_button()
-        
-        # Set question as current line
         state.process_stt_text("chat", question, is_final=True)
         
-        return JSONResponse({
-            "success": True,
-            "message": "Question received",
-            "question": question,
-            "timestamp": time.time()
-        })
+        return JSONResponse({"success": True})
         
     except Exception as e:
-        print(f"❌ Chat question error: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
-# ================= AUDIO MANAGEMENT =================
 def start_audio_services():
-    """Start audio services on startup"""
-    print("🎧 Starting audio services...")
-    print(f"   Mic: {'UNMUTED' if not state.mute_mic else 'MUTED (UI only)'}")
-    print(f"   System: {'UNMUTED' if not state.mute_system else 'MUTED (UI only)'}")
-    
     try:
-        # Start system audio
         start_system_stt(speech_config, on_system_text)
-        print("✅ System STT service started")
-        
-        # Start mic with callback
         start_mic_stt(on_mic_text)
-        print("✅ Mic STT service started")
-        
-        print("🎧 Audio services initialized")
-        
+        print("✅ Audio services started")
     except Exception as e:
-        print(f"❌ Failed to start audio services: {e}")
+        print(f"❌ Audio error: {e}")
         threading.Timer(3.0, start_audio_services).start()
 
-# ================= webpage landing =================
 @app.get("/", response_class=HTMLResponse)
 def landing_page():
     with open("app/web/index.html", "r", encoding="utf-8") as f:
@@ -571,123 +698,33 @@ def landing_page():
 
 @app.get("/download")
 def download_exe():
-    exe_path = os.path.join(
-        BASE_DIR,
-        "downloads",
-        "InterviewHelperSetup.exe"
-    )
+    exe_path = os.path.join(BASE_DIR, "downloads", "InterviewHelperSetup.exe")
+    return FileResponse(path=exe_path, filename="InterviewHelperSetup.exe")
 
-    if not os.path.exists(exe_path):
-        raise HTTPException(status_code=404, detail="EXE file not found")
-
-    return FileResponse(
-        path=exe_path,
-        filename="InterviewHelperSetup.exe",
-        media_type="application/octet-stream"
-    )
-
-# ================= CONTROL ENDPOINTS =================
 @app.post("/toggle-mic")
 async def toggle_mic():
-    """Toggle microphone"""
     with state.lock:
         new_state = not state.mute_mic
         state.set_mute_state("mic", new_state)
-        status = "MUTED (UI)" if new_state else "UNMUTED"
-        print(f"🎤 Microphone {status}")
-    
-    return JSONResponse({
-        "muted": state.mute_mic,
-        "status": get_mic_status(),
-        "message": f"Microphone {status}"
-    })
+    return JSONResponse({"muted": state.mute_mic})
 
 @app.post("/toggle-system")
 async def toggle_system():
-    """Toggle system audio"""
     with state.lock:
         new_state = not state.mute_system
         state.set_mute_state("system", new_state)
-        status = "MUTED (UI)" if new_state else "UNMUTED"
-        print(f"💻 System Audio {status}")
-    
-    return JSONResponse({
-        "muted": state.mute_system,
-        "status": get_system_status(),
-        "message": f"System audio {status}"
-    })
-
-# ================= DEBUG & STATUS ENDPOINTS =================
-@app.get("/debug-mic-text")
-def debug_mic_text():
-    """Debug endpoint to test mic text manually"""
-    state.process_stt_text("mic", "TEST MIC TEXT - Hello from microphone", is_final=True)
-    return JSONResponse({
-        "success": True,
-        "message": "Test mic text sent",
-        "current_line": state.current_line
-    })
-
-@app.get("/debug-system-text")
-def debug_system_text():
-    """Debug endpoint to test system text manually"""
-    state.process_stt_text("system", "TEST SYSTEM TEXT - Hello from system", is_final=True)
-    return JSONResponse({
-        "success": True,
-        "message": "Test system text sent",
-        "current_line": state.current_line
-    })
-
-@app.get("/audio-status")
-async def audio_status():
-    """Get complete audio status"""
-    with state.lock:
-        return JSONResponse({
-            "mic": {
-                "muted": state.mute_mic,
-                "details": get_mic_status()
-            },
-            "system": {
-                "muted": state.mute_system,
-                "details": get_system_status()
-            },
-            "state": {
-                "current_line": state.current_line,
-                "partial_buffer": state.partial_buffer,
-                "is_ai_responding": state.is_ai_responding,
-                "last_source": state.last_source
-            }
-        })
+    return JSONResponse({"muted": state.mute_system})
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint"""
-    with state.lock:
-        time_since_last_audio = time.time() - state.last_audio_ts
-        
-        return JSONResponse({
-            "status": "healthy",
-            "database": "connected",
-            "audio": {
-                "mic_muted": state.mute_mic,
-                "system_muted": state.mute_system,
-                "backend_status": "ALWAYS RUNNING"
-            },
-            "transcript": {
-                "current_line": state.current_line,
-                "current_line_length": len(state.current_line),
-                "partial_buffer": state.partial_buffer,
-                "seconds_since_last_audio": round(time_since_last_audio, 1)
-            },
-            "current_session": current_session_id,
-            "ai_responding": state.is_ai_responding
-        })
+    return JSONResponse({"status": "healthy", "model": DEPLOYMENT})
 
 # ================= STARTUP =================
 @app.on_event("startup")
 def startup():
     try:
-        print("🔥 Warming Azure OpenAI STREAMING...")
+        print(f"🔥 Warming {DEPLOYMENT} for ultra-fast responses...")
+        # Warm up the model
         stream = client.chat.completions.create(
             model=DEPLOYMENT,
             messages=[{"role": "user", "content": "ping"}],
@@ -696,15 +733,30 @@ def startup():
         )
         for _ in stream:
             break
-        print("✅ Azure OpenAI streaming warmed")
+        print(f"✅ {DEPLOYMENT} ready - First token in 1-2 seconds expected!")
     except Exception as e:
-        print("⚠️ Azure warm-up failed:", e)
+        print(f"⚠️ Warm-up failed: {e}")
 
-    threading.Thread(
-        target=start_audio_services,
-        daemon=True
-    ).start()
+    threading.Thread(target=start_audio_services, daemon=True).start()
 
+@app.get("/api/test-stream")
+async def test_stream():
+    """Test endpoint to verify streaming works"""
+    async def generate():
+        words = ["This", "is", "a", "test", "of", "streaming", "responses."]
+        for word in words:
+            yield f"data: {json.dumps({'type': 'ai_stream', 'content': word + ' '})}\n\n"
+            await asyncio.sleep(0.1)
+        yield f"data: {json.dumps({'type': 'ai_complete', 'content': 'Test complete!'})}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 # ================= MAIN =================
 if __name__ == "__main__":
@@ -714,12 +766,11 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
 
     config = uvicorn.Config(
-        app=app,                 # 🔥 PASS APP OBJECT, NOT STRING
+        app=app,
         host="127.0.0.1",
         port=8000,
         log_level="info",
-        loop="asyncio",
-        lifespan="on"
+        loop="asyncio"
     )
 
     server = uvicorn.Server(config)
