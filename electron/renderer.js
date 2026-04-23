@@ -17,8 +17,9 @@ document.addEventListener("DOMContentLoaded", function() {
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 10;
     
-    // 🔥 NEW: Overlay position for <> key movement
-    let overlayPosition = 0;
+    // 🔥 NEW: Overlay position for arrow key movement (both X and Y)
+    let overlayPositionX = 0;  // Horizontal position (left/right)
+    let overlayPositionY = 0;  // Vertical position (up/down)
     const OVERLAY_MOVE_STEP = 20;
     
     // Duplicate prevention tracking
@@ -75,7 +76,45 @@ document.addEventListener("DOMContentLoaded", function() {
     // Window elements for dragging
     const windowShell = document.getElementById("windowShell");
     const aiToolbar = document.getElementById("aiToolbar");
-    const aiPanel = document.getElementById("aiPanel");
+        const aiPanel = document.getElementById("aiPanel");
+
+        // ========== Overlay Q/A Panel Resize Logic ==========
+        const resizeHandle = aiPanel ? aiPanel.querySelector(".ai-panel-resize") : null;
+        let isResizing = false;
+        let startY = 0;
+        let startHeight = 0;
+        let startX = 0;
+        let startWidth = 0;
+
+        if (resizeHandle && aiPanel) {
+            resizeHandle.addEventListener("mousedown", function(e) {
+                isResizing = true;
+                startY = e.clientY;
+                startHeight = aiPanel.offsetHeight;
+                startX = e.clientX;
+                startWidth = aiPanel.offsetWidth;
+                document.body.style.userSelect = "none";
+            });
+
+            document.addEventListener("mousemove", function(e) {
+                if (!isResizing) return;
+                // Resize vertically and horizontally
+                let newHeight = startHeight + (e.clientY - startY);
+                let newWidth = startWidth + (e.clientX - startX);
+                // Clamp to window size
+                newHeight = Math.max(180, Math.min(window.innerHeight - aiPanel.offsetTop - 20, newHeight));
+                newWidth = Math.max(320, Math.min(window.innerWidth - aiPanel.offsetLeft - 20, newWidth));
+                aiPanel.style.height = newHeight + "px";
+                aiPanel.style.width = newWidth + "px";
+            });
+
+            document.addEventListener("mouseup", function() {
+                if (isResizing) {
+                    isResizing = false;
+                    document.body.style.userSelect = "";
+                }
+            });
+        }
 
     // ================= 🔥 CURSOR CONTROL - NO HAND SYMBOLS =================
     function setupCursorControl() {
@@ -164,65 +203,111 @@ document.addEventListener("DOMContentLoaded", function() {
         console.log("✅ Cursor control active - NO HAND SYMBOLS, cursor hidden during screen share");
     }
 
-    // ================= 🔥 OVERLAY MOVEMENT WITH <> KEYS =================
-    function setupOverlayMovement() {
-        console.log("🔄 Setting up overlay movement with < > keys...");
-        
-        const overlayElements = [aiToolbar, aiPanel].filter(el => el !== null);
-        
-        if (overlayElements.length === 0) {
-            console.log("⚠️ No overlay elements found for <> key movement");
-            return;
-        }
-        
-        console.log(`✅ Found ${overlayElements.length} overlay elements for <> movement`);
-        
-        overlayPosition = 0;
-        
-        document.removeEventListener('keydown', handleBracketKeys);
-        document.addEventListener('keydown', handleBracketKeys);
-        
-        function handleBracketKeys(event) {
-            const activeElement = document.activeElement;
-            const isInputFocused = activeElement.tagName === 'INPUT' || 
-                                 activeElement.tagName === 'TEXTAREA' ||
-                                 activeElement.isContentEditable;
-            
-            if (isInputFocused) {
-                return;
-            }
-            
-            // 🔥 < key = move left, > key = move right (Shift + , or Shift + .)
-            if (event.key === ',' && event.shiftKey && !event.ctrlKey && !event.altKey) {
-                event.preventDefault();
-                overlayPosition -= OVERLAY_MOVE_STEP;
-                console.log(`⬅️ < key pressed - Moving overlay LEFT: ${overlayPosition}px`);
-                
-                overlayElements.forEach(el => {
-                    if (el) {
-                        el.style.transform = `translateX(${overlayPosition}px)`;
-                        el.style.transition = 'transform 0.1s ease-out';
-                    }
-                });
-            }
-            
-            if (event.key === '.' && event.shiftKey && !event.ctrlKey && !event.altKey) {
-                event.preventDefault();
-                overlayPosition += OVERLAY_MOVE_STEP;
-                console.log(`➡️ > key pressed - Moving overlay RIGHT: ${overlayPosition}px`);
-                
-                overlayElements.forEach(el => {
-                    if (el) {
-                        el.style.transform = `translateX(${overlayPosition}px)`;
-                        el.style.transition = 'transform 0.1s ease-out';
-                    }
-                });
-            }
-        }
-        
-        console.log("✅ Overlay movement ready - < moves LEFT, > moves RIGHT");
-    }
+    // ================= 🔥 OVERLAY MOVEMENT WITH CTRL+ARROW KEYS (UP/DOWN/LEFT/RIGHT) =================
+ // ================= 🔥 GLOBAL HOTKEY HANDLER - UPDATED =================
+window.electronAPI.onGlobalHotkey((data) => {
+    const key = data.hotkey;
+    const step = 20;
+    
+    console.log(`🌍 Global hotkey received: ${key}`);
 
+    switch (key) {
+        case 'answer':
+            if (btnAnswer && !btnAnswer.disabled) {
+                handleAnswerButton();
+            }
+            break;
+
+        case 'clear':
+            if (btnClear) {
+                handleClearButton();
+            }
+            break;
+
+        case 'chat':
+            if (toolbarChat) {
+                toolbarChat.click();
+            }
+            break;
+
+        case 'mic':
+            toggleMic();
+            break;
+
+        case 'system':
+            toggleSystem();
+            break;
+
+        case 'move-left':
+            moveOverlay(-step, 0);
+            break;
+
+        case 'move-right':
+            moveOverlay(step, 0);
+            break;
+
+        case 'move-up':
+            moveOverlay(0, -step);
+            break;
+
+        case 'move-down':
+            moveOverlay(0, step);
+            break;
+            
+        case 'scroll-down':
+            scrollAnswerArea(100);
+            break;
+            
+        case 'scroll-up':
+            scrollAnswerArea(-100);
+            break;
+            
+        case 'page-down':
+            scrollAnswerArea(qaAnswer?.clientHeight * 0.8 || 400);
+            break;
+            
+        case 'page-up':
+            scrollAnswerArea(-(qaAnswer?.clientHeight * 0.8 || 400));
+            break;
+    }
+});
+
+// 🔥 Helper function for scrolling
+function scrollAnswerArea(delta) {
+    if (qaAnswer) {
+        qaAnswer.scrollTop += delta;
+        isAutoScrollEnabled = false;
+        lastUserScrollTime = Date.now();
+        console.log(`📜 Scrolled ${delta > 0 ? 'down' : 'up'} by ${Math.abs(delta)}px`);
+    }
+}
+// ================= 🔥 OVERLAY MOVEMENT FUNCTION =================
+function setupOverlayMovement() {
+    console.log("📍 Setting up overlay movement...");
+    // The actual movement is handled by the global hotkey handler
+    // This function exists for initialization consistency
+}
+
+let posX = 0;
+let posY = 0;
+
+function moveOverlay(dx, dy) {
+    posX += dx;
+    posY += dy;
+
+    const elements = [
+        document.getElementById("aiToolbar"),
+        document.getElementById("aiPanel")
+    ];
+
+    elements.forEach(el => {
+        if (el) {
+            el.style.transform = `translate(calc(-50% + ${posX}px), ${posY}px)`;
+        }
+    });
+    
+    console.log(`📍 Overlay moved to: (${posX}px, ${posY}px)`);
+}
     // ================= STATUS UPDATES - NO ALERT TAB =================
     function updateAudioStatus() {
         if (btnMic) {
@@ -280,6 +365,172 @@ document.addEventListener("DOMContentLoaded", function() {
         }
     }
     
+    // ================= 🔥 CLICK-THROUGH OVERLAY (PARAKEET BEHAVIOR) =================
+// ================= 🔥 CLICK-THROUGH OVERLAY (PARAKEET BEHAVIOR) =================
+function setupMousePrevention() {
+    console.log("🦜 Setting up Parakeet Behavior - Selective Interactivity...");
+    
+    const overlayBar = document.getElementById('aiToolbar');
+    const overlayPanel = document.getElementById('aiPanel');
+    
+    // 🔥 KEY FIX: Don't block entire panel - let window-level control handle it
+    if (overlayBar) {
+        // Make the toolbar itself receive events (interactive elements inside handle)
+        overlayBar.style.pointerEvents = 'auto';
+        
+        // Make buttons/icons interactive
+        overlayBar.querySelectorAll('button, .circle-icon, .square-icon, .pill').forEach(el => {
+            el.style.pointerEvents = 'auto';
+        });
+    }
+    
+    if (overlayPanel) {
+        // 🔥 Don't set pointer-events: none on entire panel
+        // Instead, let window-level setIgnoreMouseEvents() control it
+        overlayPanel.style.pointerEvents = 'auto';
+        
+        // Make all interactive elements explicitly auto
+        const interactiveElements = overlayPanel.querySelectorAll(`
+            .ai-panel-header,
+            .control-row,
+            .qa-card,
+            .chat-row,
+            .qa-footer,
+            button,
+            input,
+            textarea,
+            select
+        `);
+        
+        interactiveElements.forEach(el => {
+            el.style.pointerEvents = 'auto';
+        });
+        
+        // Make Q&A containers interactive
+        const qaAnswer = overlayPanel.querySelector('#qaAnswer');
+        const qaQuestion = overlayPanel.querySelector('#qaQuestion');
+        if (qaAnswer) qaAnswer.style.pointerEvents = 'auto';
+        if (qaQuestion) qaQuestion.style.pointerEvents = 'auto';
+    }
+    
+    console.log("✅ Parakeet Behavior active:");
+    console.log("   🟢 Interactive zones: buttons, Q&A card, inputs, header");
+    console.log("   🔴 Non-interactive zones: controlled by click-through overlay");
+}
+
+    // ================= 🔥 CLICK-THROUGH OVERLAY SETUP =================
+    function setupClickThroughOverlay() {
+        console.log("🔥 Setting up click-through overlay behavior...");
+        
+        if (!window.electronAPI || !window.electronAPI.toggleClickThrough) {
+            console.warn("⚠️ Electron API not available - click-through overlay disabled");
+            return;
+        }
+        
+        // 🔥 Track current interactive state to avoid redundant calls
+        let currentInteractiveState = false;
+        let lastCheckTime = 0;
+        const THROTTLE_MS = 50;  // Check every 50ms max
+        
+        // 🔥 Track mouse movements to toggle click-through (with throttling)
+        document.addEventListener('mousemove', (e) => {
+            const now = Date.now();
+            if (now - lastCheckTime < THROTTLE_MS) return;
+            lastCheckTime = now;
+            
+            const element = document.elementFromPoint(e.clientX, e.clientY);
+            const isInteractive = checkIfElementIsInteractive(element);
+            
+            // Only send if state changed (avoid spamming IPC)
+            if (isInteractive !== currentInteractiveState) {
+                currentInteractiveState = isInteractive;
+                
+                // Toggle click-through based on whether hovering over interactive element
+                if (isInteractive) {
+                    // Over interactive element: enable mouse events (DON'T ignore mouse)
+                    window.electronAPI.toggleClickThrough(false);
+                    console.log('✅ INTERACTIVE - Window receives clicks');
+                } else {
+                    // Over empty area: disable mouse events (ignore mouse, pass through)
+                    window.electronAPI.toggleClickThrough(true);
+                    console.log('🔴 PASS-THROUGH - Clicks go to apps behind');
+                }
+            }
+        });
+        
+        // 🔥 Reset to pass-through when mouse leaves window
+        document.addEventListener('mouseleave', () => {
+            currentInteractiveState = false;
+            window.electronAPI.toggleClickThrough(true);
+            console.log('👋 Mouse left overlay - PASS-THROUGH enabled');
+        });
+        
+        // 🔥 Initial state: pass-through
+        window.electronAPI.toggleClickThrough(true);
+        
+        console.log("✅ Click-through overlay active");
+        console.log("   🟢 Interactive elements: handle clicks");
+        console.log("   🔴 Empty areas: clicks pass to apps behind");
+    }
+    
+    // 🔥 Helper function to check if element should be interactive
+    function checkIfElementIsInteractive(element) {
+        if (!element) return false;
+        
+        // List of interactive elements
+        const interactiveSelectors = [
+            'button', 
+            'input', 
+            'textarea', 
+            'select',
+            'a',
+            '.primary-btn',
+            '.secondary-btn',
+            '.tab',
+            '.ctrl',
+            '.circle-icon',
+            '.square-icon',
+            '.qa-card',
+            '.chat-row',
+            '.control-row',
+            '.ai-panel-header',
+            'label',
+            '[role="button"]',
+            '[contenteditable]'
+        ];
+        
+        // Check if element or any parent is interactive
+        let current = element;
+        while (current && current !== document.body) {
+            // Check tag name
+            if (interactiveSelectors.includes(current.tagName.toLowerCase())) {
+                return true;
+            }
+            
+            // Check class names
+            for (const selector of interactiveSelectors) {
+                if (selector.startsWith('.') && current.classList.contains(selector.slice(1))) {
+                    return true;
+                }
+            }
+            
+            // Check data attributes
+            if (current.getAttribute('role') === 'button') {
+                return true;
+            }
+            
+            // Check pointer-events
+            const pointerEvents = window.getComputedStyle(current).pointerEvents;
+            if (pointerEvents === 'none') {
+                return false;  // Stop checking up the chain if pointer-events is none
+            }
+            
+            current = current.parentElement;
+        }
+        
+        return false;
+    }
+
     // ================= DRAG ANYWHERE FUNCTIONALITY =================
     function setupDragAnywhere() {
         console.log("🖱️ Setting up drag anywhere functionality...");
@@ -1718,76 +1969,7 @@ addReadabilityStyles();
         });
     }
     
-    // ================= 🔥 HOTKEYS - SHIFT REMOVED FROM CLEAR, <> MOVES OVERLAY =================
-    function setupHotkeys() {
-        console.log("⌨️ Setting up keyboard hotkeys (Shift removed from clear, <> moves overlay)...");
-        
-        document.addEventListener('keydown', function(event) {
-            const activeElement = document.activeElement;
-            const isInputFocused = activeElement.tagName === 'INPUT' || 
-                                 activeElement.tagName === 'TEXTAREA' ||
-                                 activeElement.isContentEditable;
-            
-            if (isInputFocused) {
-                return;
-            }
-            
-            // 🔥 ANSWER BUTTON: SPACE key
-            if (event.code === 'Space' && !event.repeat && !event.ctrlKey && !event.altKey) {
-                console.log("⌨️ SPACE key pressed - Triggering answer");
-                event.preventDefault();
-                if (btnAnswer && !btnAnswer.disabled) {
-                    handleAnswerButton();
-                }
-            }
-            
-            // 🔥 CLEAR BUTTON: C key ONLY (Shift removed)
-            if (event.code === 'KeyC' && !event.repeat && !event.ctrlKey && !event.altKey) {
-                console.log("⌨️ C key pressed - Clearing text");
-                event.preventDefault();
-                if (btnClear) {
-                    handleClearButton();
-                }
-            }
-            
-            // 🔥 MIC TOGGLE: M key
-            if (event.code === 'KeyM' && !event.repeat) {
-                console.log("⌨️ M key pressed - Toggling microphone");
-                event.preventDefault();
-                toggleMic();
-            }
-            
-            // 🔥 SYSTEM TOGGLE: N key
-            if (event.code === 'KeyN' && !event.repeat) {
-                console.log("⌨️ N key pressed - Toggling system audio");
-                event.preventDefault();
-                toggleSystem();
-            }
-            
-            // 🔥 CHAT BOX TOGGLE: Ctrl+V
-            if (event.ctrlKey && event.code === 'KeyV' && !event.repeat) {
-                console.log("⌨️ Ctrl+V pressed - Toggling chat box");
-                event.preventDefault();
-                if (toolbarChat) {
-                    toolbarChat.click();
-                }
-            }
-            
-            // 🔥 CHAT BOX TOGGLE: Ctrl+Shift+V (alternative)
-            if (event.ctrlKey && event.shiftKey && event.code === 'KeyV' && !event.repeat) {
-                console.log("⌨️ Ctrl+Shift+V pressed - Toggling chat box");
-                event.preventDefault();
-                if (toolbarChat) {
-                    toolbarChat.click();
-                }
-            }
-            
-            // 🔥 NOTE: Shift key is NOT handled here anymore - it's handled in setupOverlayMovement for <> keys
-        });
-        
-        console.log("✅ Hotkeys setup complete - Shift key removed from clear, <> moves overlay");
-    }
-    
+
     // ================= CODE COPY FUNCTIONALITY =================
     function setupCodeCopyButtons() {
         document.addEventListener('click', function(event) {
@@ -2068,8 +2250,14 @@ addReadabilityStyles();
         // 🔥 NEW: Cursor control - NO HAND SYMBOLS
         setupCursorControl();
         
-        // 🔥 NEW: Overlay movement with <> keys
+        // 🔥 NEW: Overlay movement with arrow keys
         setupOverlayMovement();
+        
+        // 🔥 NEW: Prevent mouse pass-through to background
+        setupMousePrevention();
+        
+        // 🔥 NEW: Click-through overlay (empty areas pass clicks)
+        setupClickThroughOverlay();
         
         addStyles();
         setupWindowControls();
@@ -2077,7 +2265,7 @@ addReadabilityStyles();
         setupSteps();
         setupEventListeners();
         setupChatBox();
-        setupHotkeys();
+       
         setupCodeCopyButtons();
         setupArrowKeyNavigation();
         setupDragAnywhere();
